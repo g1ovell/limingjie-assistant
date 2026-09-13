@@ -10,6 +10,7 @@
 
     <queries>
         <package android:name="com.bilibili.priconne" />
+        <package android:name="com.bilibili.priconne.mi" />
     </queries>
 
     <application

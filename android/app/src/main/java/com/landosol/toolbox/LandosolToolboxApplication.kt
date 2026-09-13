@@ -6,11 +6,15 @@ import android.content.pm.PackageManager
 import android.util.Log
 import com.landosol.toolbox.account.AccountRepository
 import com.landosol.toolbox.automation.AutomationAction
+import com.landosol.toolbox.automation.GameClientProfile
+import com.landosol.toolbox.automation.GameClientProfileResolver
+import com.landosol.toolbox.automation.GameClientResolution
 import com.landosol.toolbox.automation.AutomationSessionManager
 import com.landosol.toolbox.automation.ScreenPoint
 import com.landosol.toolbox.automation.SessionBoundActionExecutor
 import com.landosol.toolbox.automation.accessibility.AndroidAccessibilityActionBackend
 import com.landosol.toolbox.automation.accessibility.LandosolAccessibilityService
+import com.landosol.toolbox.automation.accessibility.isExpectedGamePackage
 import com.landosol.toolbox.automation.capture.CaptureFrameBus
 import com.landosol.toolbox.automation.capture.CapturedFrame
 import com.landosol.toolbox.automation.capture.CaptureStateRegistry
@@ -68,6 +72,9 @@ import kotlinx.coroutines.launch
 
 class LandosolToolboxApplication : Application() {
     private val databaseUpdateScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val gameClientResolution by lazy { GameClientProfileResolver.resolve(packageManager) }
+    private val resolvedGameClient: GameClientProfile?
+        get() = (gameClientResolution as? GameClientResolution.Available)?.profile
 
     override fun onCreate() {
         super.onCreate()
@@ -91,7 +98,9 @@ class LandosolToolboxApplication : Application() {
     val automationOverlayCoordinator by lazy {
         AutomationOverlayCoordinator(AndroidAutomationNotificationHost(this))
     }
-    private val accessibilityActionBackend by lazy { AndroidAccessibilityActionBackend() }
+    private val accessibilityActionBackend by lazy {
+        AndroidAccessibilityActionBackend { resolvedGameClient?.packageName }
+    }
     val automationActionExecutor by lazy {
         SessionBoundActionExecutor(automationSessionManager, accessibilityActionBackend)
     }
@@ -163,7 +172,7 @@ class LandosolToolboxApplication : Application() {
             actionExecutor = automationActionExecutor,
             actionsAvailable = LandosolAccessibilityService::isConnected,
             actionTargetReady = {
-                LandosolAccessibilityService.foregroundPackage() == GAME_PACKAGE_NAME
+                isExpectedGamePackage(resolvedGameClient?.packageName, LandosolAccessibilityService.foregroundPackage())
             },
             actionPlannerFactory = {
                 LabyrinthEntryActionPlanner(
@@ -200,7 +209,7 @@ class LandosolToolboxApplication : Application() {
                 }
             },
             gameLauncher = gameLauncher@{
-                val intent = packageManager.getLaunchIntentForPackage(GAME_PACKAGE_NAME)
+                val intent = resolvedGameClient?.packageName?.let(packageManager::getLaunchIntentForPackage)
                     ?: return@gameLauncher false
                 runCatching {
                     startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -265,7 +274,7 @@ class LandosolToolboxApplication : Application() {
     val gameSessionResetWorkflow by lazy {
         val frameTracker = SessionExpiryFrameTracker()
         val presence = AccessibilityForegroundPresenceObserver(
-            gamePackageName = GAME_PACKAGE_NAME,
+            gamePackageName = resolvedGameClient?.packageName.orEmpty(),
             foregroundPackage = LandosolAccessibilityService::foregroundPackage,
         )
         val terminator = SessionExpiryTerminator(
@@ -289,7 +298,7 @@ class LandosolToolboxApplication : Application() {
             backend = CompositeSessionResetBackend(
                 terminator = terminator,
                 relauncher = Relauncher {
-                    val intent = packageManager.getLaunchIntentForPackage(GAME_PACKAGE_NAME)
+                    val intent = resolvedGameClient?.packageName?.let(packageManager::getLaunchIntentForPackage)
                         ?: return@Relauncher GameClientRelaunchResult.LAUNCH_UNAVAILABLE
                     runCatching {
                         startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -376,7 +385,6 @@ class LandosolToolboxApplication : Application() {
 
     private companion object {
         const val DATABASE_UPDATE_LOG_TAG = "LabyrinthCnDatabase"
-        const val GAME_PACKAGE_NAME = "com.bilibili.priconne"
         /** 触发入口「冒险→黎明界」，与 [LabyrinthEntryActionPlanner] 的锚点一致 */
         val SESSION_EXPIRY_TRIGGER_POINT = ScreenPoint(1735f, 805f)
         /** 「返回标题」按钮（模板中心，1080p 参考系） */

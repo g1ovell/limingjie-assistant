@@ -12,6 +12,7 @@ import android.view.accessibility.AccessibilityEvent
 import com.landosol.toolbox.automation.AutomationAction
 import com.landosol.toolbox.automation.AutomationActionBackend
 import com.landosol.toolbox.automation.AutomationBackendResult
+import com.landosol.toolbox.automation.GameClientProfiles
 import com.landosol.toolbox.automation.capture.CaptureStateRegistry
 import kotlin.coroutines.resume
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -252,14 +253,14 @@ class LandosolAccessibilityService : AccessibilityService() {
 }
 
 class AndroidAccessibilityActionBackend(
-    private val expectedPackageName: String? = GAME_PACKAGE_NAME,
+    private val expectedPackageName: () -> String? = { GameClientProfiles.BILIBILI.packageName },
 ) : AutomationActionBackend {
     override suspend fun execute(action: AutomationAction): AutomationBackendResult {
         if (!action.hasValidCoordinates()) return AutomationBackendResult.Rejected("动作坐标无效")
         val service = LandosolAccessibilityService.current()
             ?: return AutomationBackendResult.Rejected("无障碍服务未连接")
         val foregroundPackage = LandosolAccessibilityService.foregroundPackage()
-        if (expectedPackageName != null && foregroundPackage != expectedPackageName) {
+        if (!isExpectedGamePackage(expectedPackageName(), foregroundPackage)) {
             return AutomationBackendResult.Rejected(GAME_NOT_FOREGROUND_REASON)
         }
         return service.perform(
@@ -274,7 +275,7 @@ class AndroidAccessibilityActionBackend(
         AutomationAction.Back -> true
     }
 
-    private companion object {
-        const val GAME_PACKAGE_NAME = "com.bilibili.priconne"
-    }
 }
+
+internal fun isExpectedGamePackage(expectedPackageName: String?, foregroundPackageName: String?): Boolean =
+    expectedPackageName != null && foregroundPackageName == expectedPackageName
