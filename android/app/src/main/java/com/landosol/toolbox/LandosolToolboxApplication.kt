@@ -43,6 +43,7 @@ import com.landosol.toolbox.labyrinth.LabyrinthCnDatabaseUpdateResult
 import com.landosol.toolbox.labyrinth.LabyrinthRoleDecisionDataResult
 import com.landosol.toolbox.labyrinth.RoomLabyrinthRunStateStore
 import com.landosol.toolbox.labyrinth.RoomLabyrinthRouteStore
+import com.landosol.toolbox.labyrinth.BilibiliLabyrinthRouteSource
 import com.landosol.toolbox.labyrinth.node.AndroidLabyrinthNodeTemplateLoader
 import com.landosol.toolbox.labyrinth.vision.AndroidLabyrinthEntryFrameProcessor
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryFrameResult
@@ -61,8 +62,6 @@ import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionStartResult
 import com.landosol.toolbox.labyrinth.LabyrinthAutoRunConfig
 import com.landosol.toolbox.labyrinth.LabyrinthAutoRunWorkflow
 import com.landosol.toolbox.labyrinth.LabyrinthAutoRunRoundOutcome
-import com.landosol.toolbox.labyrinth.LabyrinthExecutionGateResult
-import com.landosol.toolbox.labyrinth.validateLabyrinthExecution
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -189,13 +188,7 @@ class LandosolToolboxApplication : Application() {
             battleTeamRecommendationUnavailableReason = roleDecisionUnavailableReason,
             battleTeamSelectionPlanner = roleDecisionRuntime?.battleTeamSelectionPlanner,
             runStateStore = labyrinthRunStateStore,
-            routeLoader = { accountId ->
-                accountId?.let { labyrinthRouteStore.loadLatest(it) }
-            },
-            routeProgressSaver = { accountId, enterId, currentBlockId ->
-                labyrinthRouteStore.updateCurrentBlock(accountId, enterId, currentBlockId)
-            },
-            routeExecutionGate = ::validateLabyrinthExecutionForAccount,
+            routeSource = labyrinthRouteSource,
             nodeTemplateLoader = { AndroidLabyrinthNodeTemplateLoader(this).load() },
             debugFramePublisher = debugDashboard?.let { dashboard ->
                 { frame, state, result, presentation ->
@@ -220,6 +213,12 @@ class LandosolToolboxApplication : Application() {
     val database: AppDatabase by lazy { AppDatabase.create(this) }
     val labyrinthRunStateStore by lazy { RoomLabyrinthRunStateStore(database) }
     val labyrinthRouteStore by lazy { RoomLabyrinthRouteStore(database) }
+    val labyrinthRouteSource by lazy {
+        BilibiliLabyrinthRouteSource(
+            routeStore = labyrinthRouteStore,
+            checkpointStore = com.landosol.toolbox.labyrinth.RoomLabyrinthRerollCheckpointStore(database),
+        )
+    }
     private val credentialStore by lazy { AndroidKeystoreCredentialStore(this) }
     private val sessionStore by lazy { AndroidKeystoreSdkSessionStore(this) }
     val gameSessionRegistry by lazy { InMemoryGameSessionRegistry() }
@@ -253,18 +252,6 @@ class LandosolToolboxApplication : Application() {
             settingsStore = com.landosol.toolbox.labyrinth.AndroidLabyrinthRerollSettingsStore(this),
             launchForeground = { com.landosol.toolbox.labyrinth.LabyrinthRerollService.start(this) },
         )
-    }
-
-    private suspend fun validateLabyrinthExecutionForAccount(
-        accountId: Long?,
-    ): LabyrinthExecutionGateResult {
-        val id = accountId
-            ?: return LabyrinthExecutionGateResult.Blocked("未选择账号，已禁止执行保存路线")
-        val route = labyrinthRouteStore.loadLatest(id)
-        val checkpoint = com.landosol.toolbox.labyrinth.RoomLabyrinthRerollCheckpointStore(database).load(id)
-        // 执行入口复用上次刷开局/“当前开局”成功后保存的 TARGET 检查点。
-        // 这里不能再次调用 top：应用进程重启后内存游戏会话不存在，也不应因此要求用户重新登录。
-        return validateLabyrinthExecution(route, checkpoint, top = null)
     }
 
     /**

@@ -15,7 +15,6 @@ import com.landosol.toolbox.protocol.bilibili.BilibiliNativeLoginCoordinator
 import com.landosol.toolbox.protocol.bilibili.CaptchaProof
 import com.landosol.toolbox.protocol.bilibili.GameSessionRegistry
 import com.landosol.toolbox.protocol.bilibili.NativeLoginResult
-import com.landosol.toolbox.protocol.labyrinth.BilibiliLabyrinthApi
 import com.landosol.toolbox.protocol.labyrinth.LabyrinthFailureKind
 import com.landosol.toolbox.protocol.labyrinth.LabyrinthOperationResult
 import kotlinx.coroutines.CancellationException
@@ -131,6 +130,7 @@ class LabyrinthController(
     private val loginCoordinatorProvider: () -> BilibiliNativeLoginCoordinator?,
     private val settingsStore: LabyrinthRerollSettingsStore,
     private val launchForeground: () -> Unit,
+    private val rerollProvider: LabyrinthRerollProvider = BilibiliLabyrinthRerollProvider(),
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var settingsAccountId: Long? = null
@@ -318,7 +318,7 @@ class LabyrinthController(
                 while (true) {
                     val session = ensureGameSession(account, PendingLoginAction.START) ?: return@launch
                     val workflow = LabyrinthRerollWorkflow(
-                        api = BilibiliLabyrinthApi(session),
+                        api = rerollProvider.createApi(session),
                         routeStore = RoomLabyrinthRouteStore(database),
                         checkpointStore = RoomLabyrinthRerollCheckpointStore(database),
                     )
@@ -401,7 +401,7 @@ class LabyrinthController(
             chrome.update { it.copy(isWorking = true, message = null, progress = "读取黎明界状态") }
             try {
                 val session = ensureGameSession(account, PendingLoginAction.CHECK_STATUS) ?: return@launch
-                val api = BilibiliLabyrinthApi(session)
+                val api = rerollProvider.createApi(session)
                 val checkpointStore = RoomLabyrinthRerollCheckpointStore(database)
                 val savedCheckpoint = checkpointStore.load(account.id)
                 when (val result = api.top()) {

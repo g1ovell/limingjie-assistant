@@ -584,9 +584,7 @@ class LabyrinthEntryRecognitionSession(
     private val battleTeamRecommendationUnavailableReason: String? = null,
     private var battleTeamSelectionPlanner: LabyrinthBattleTeamSelectionPlanner? = null,
     private val runStateStore: LabyrinthRunStateStore? = null,
-    private val routeLoader: (suspend (Long?) -> LabyrinthRouteJson?)? = null,
-    private val routeProgressSaver: (suspend (Long, Long, Long) -> Boolean)? = null,
-    private val routeExecutionGate: (suspend (Long?) -> LabyrinthExecutionGateResult)? = null,
+    private val routeSource: LabyrinthRouteSource? = null,
     private val nodeTemplateLoader: (() -> NodeTemplateSet)? = null,
     private val nodeSessionFactory: () -> LabyrinthNodeSession = {
         LabyrinthNodeSession(
@@ -629,6 +627,7 @@ class LabyrinthEntryRecognitionSession(
     private var lastProcessedAt = Long.MIN_VALUE
     private var actionPlanner: LabyrinthEntryActionPlanner? = null
     @Volatile
+    private var validatedExecutionContext: LabyrinthExecutionContext? = null
     private var validatedRoute: LabyrinthRouteJson? = null
     private val openingStateReset = AtomicBoolean(false)
     @Volatile
@@ -839,23 +838,19 @@ class LabyrinthEntryRecognitionSession(
             return LabyrinthEntryRecognitionStartResult.Blocked(reason)
         }
         var executionGateMessage: String? = null
-        val executionRoute = if (!dryRun && nodeExecutionConfigured()) {
-            val gate = routeExecutionGate
-            if (gate == null) {
-                val reason = "未配置路线执行联网门禁，已禁止自动点节点"
-                _state.value = _state.value.copy(status = LabyrinthEntryRecognitionStatus.ERROR, message = reason)
-                return LabyrinthEntryRecognitionStartResult.Blocked(reason)
-            }
-            when (val result = runCatching { gate(accountId) }.getOrElse { failure ->
-                LabyrinthExecutionGateResult.Blocked(
-                    "执行前联网校验失败：${failure.message ?: "未知错误"}",
+        val executionContext = if (!dryRun && nodeExecutionConfigured()) {
+            when (val result = runCatching {
+                resolveLabyrinthExecutionContext(routeSource, accountId)
+            }.getOrElse { failure ->
+                LabyrinthExecutionContextResult.Blocked(
+                    "执行前路线来源校验失败：${failure.message ?: "未知错误"}",
                 )
             }) {
-                is LabyrinthExecutionGateResult.Allowed -> {
-                    executionGateMessage = result.message
-                    result.route
+                is LabyrinthExecutionContextResult.Ready -> {
+                    executionGateMessage = result.context.message
+                    result.context
                 }
-                is LabyrinthExecutionGateResult.Blocked -> {
+                is LabyrinthExecutionContextResult.Blocked -> {
                     _state.value = _state.value.copy(
                         status = LabyrinthEntryRecognitionStatus.ERROR,
                         message = result.message,
@@ -903,6 +898,7 @@ class LabyrinthEntryRecognitionSession(
         } catch (failure: Throwable) {
             sessionManager.stop(session.id)
             requestCaptureStop()
+            validatedExecutionContext = null
             validatedRoute = null
             val reason = "加载本局队伍状态失败：${failure.message ?: "未知错误"}"
             _state.value = _state.value.copy(status = LabyrinthEntryRecognitionStatus.ERROR, message = reason)
@@ -913,6 +909,7 @@ class LabyrinthEntryRecognitionSession(
         }.getOrElse { error ->
             sessionManager.stop(session.id)
             requestCaptureStop()
+            validatedExecutionContext = null
             validatedRoute = null
             val reason = "加载入口识别模板失败：${error.message ?: "未知错误"}"
             _state.value = _state.value.copy(status = LabyrinthEntryRecognitionStatus.ERROR, message = reason)
@@ -923,6 +920,7 @@ class LabyrinthEntryRecognitionSession(
         }
         if (registration is CaptureFrameRegistrationResult.Busy) {
             sessionManager.stop(session.id)
+            validatedExecutionContext = null
             validatedRoute = null
             val reason = "截图帧正在由${registration.owner}使用"
             _state.value = _state.value.copy(status = LabyrinthEntryRecognitionStatus.ERROR, message = reason)
@@ -931,7 +929,8 @@ class LabyrinthEntryRecognitionSession(
         lease = (registration as CaptureFrameRegistrationResult.Registered).lease
         activeSessionId = session.id
         activeRunAccountId = accountId
-        validatedRoute = executionRoute
+        validatedExecutionContext = executionContext
+        validatedRoute = executionContext?.route
         lastProcessedAt = Long.MIN_VALUE
         actionInFlight.set(false)
         stopRequested.set(false)
@@ -997,6 +996,7 @@ class LabyrinthEntryRecognitionSession(
             lease?.let(CaptureFrameBus::unregister)
             lease = null
             activeSessionId = null
+            validatedExecutionContext = null
             validatedRoute = null
             sessionManager.stop(session.id)
             requestCaptureStop()
@@ -1015,6 +1015,7 @@ class LabyrinthEntryRecognitionSession(
             lease?.let(CaptureFrameBus::unregister)
             lease = null
             activeSessionId = null
+            validatedExecutionContext = null
             validatedRoute = null
             actionPlanner = null
             sessionManager.stop(session.id)
@@ -1059,6 +1060,7 @@ class LabyrinthEntryRecognitionSession(
         firstFrameWatchdog = null
         activeSessionId = null
         activeRunAccountId = null
+        validatedExecutionContext = null
         validatedRoute = null
         actionPlanner = null
         actionInFlight.set(false)
@@ -2715,7 +2717,7 @@ class LabyrinthEntryRecognitionSession(
     }
 
     private fun nodeExecutionConfigured(): Boolean =
-        routeLoader != null && nodeTemplateLoader != null
+        nodeTemplateLoader != null
 
     private fun shouldHandOffToRouteExecution(state: LabyrinthEntryPageState): Boolean = state in setOf(
         LabyrinthEntryPageState.NODE_SELECTION,
@@ -4737,22 +4739,19 @@ class LabyrinthEntryRecognitionSession(
 
     private fun maybeStartNodeInit(sessionId: AutomationSessionId) {
         if (!nodeInitStarted.compareAndSet(false, true)) return
-        val loadRoute = routeLoader
         val loadTemplates = nodeTemplateLoader
-        if (loadRoute == null || loadTemplates == null) {
+        val executionContext = validatedExecutionContext
+        if (loadTemplates == null || executionContext == null) {
             nodeInitFailedReason = "节点执行未配置"
             finishFromPlanner(sessionId, nodeInitFailedReason!!)
             return
         }
-        val accountId = activeRunAccountId
         actionScope.launch {
             val failure: String? = run {
-                val route = validatedRoute ?: runCatching { loadRoute(accountId) }.getOrElse { error ->
-                    return@run "读取已保存路线失败：${error.message ?: "未知错误"}"
-                } ?: return@run "未找到已保存路线，请先完成刷开局"
+                val route = validatedRoute ?: executionContext.route
                 validatedRoute = route
                 if (route.allNodes.isEmpty()) {
-                    return@run "已保存路线缺少完整地图数据，请重新刷取一次"
+                    return@run "已保存路线缺少完整地图数据，请重新完成路线来源验证"
                 }
                 val templates = runCatching(loadTemplates).getOrElse { error ->
                     return@run "加载节点模板失败：${error.message ?: "未知错误"}"
@@ -5178,9 +5177,9 @@ class LabyrinthEntryRecognitionSession(
     ) {
         if (_state.value.dryRun) return
         val currentBlockId = nodeState.currentNodeId ?: return
-        val accountId = activeRunAccountId ?: return
-        val route = validatedRoute ?: return
-        val saver = routeProgressSaver ?: return
+        val context = validatedExecutionContext ?: return
+        val source = routeSource ?: return
+        val route = validatedRoute ?: context.route
         val advancedRoute = route.withAdvancedCurrentBlock(currentBlockId)
         if (advancedRoute == null) {
             nodeLog(
@@ -5190,11 +5189,13 @@ class LabyrinthEntryRecognitionSession(
             )
             return
         }
+        val advancedContext = context.copy(route = advancedRoute)
+        validatedExecutionContext = advancedContext
         validatedRoute = advancedRoute
         actionScope.launch {
             val result = runCatching {
                 persistenceMutex.withLock {
-                    saver(accountId, advancedRoute.enterId, currentBlockId)
+                    source.updateCurrentBlock(advancedContext, currentBlockId)
                 }
             }
             if (activeSessionId != sessionId) return@launch
@@ -5202,10 +5203,12 @@ class LabyrinthEntryRecognitionSession(
                 onSuccess = { persisted ->
                     nodeLog(
                         if (persisted) {
-                            "route-progress-persisted account=$accountId enterId=${advancedRoute.enterId} " +
+                            "route-progress-persisted source=${advancedContext.source} " +
+                                "account=${advancedContext.accountId} enterId=${advancedRoute.enterId} " +
                                 "current=$currentBlockId area=${nodeState.currentArea}"
                         } else {
-                            "route-progress-persist-rejected account=$accountId " +
+                            "route-progress-rejected source=${advancedContext.source} " +
+                                "account=${advancedContext.accountId} " +
                                 "enterId=${advancedRoute.enterId} current=$currentBlockId"
                         },
                         warning = !persisted,
@@ -5213,7 +5216,8 @@ class LabyrinthEntryRecognitionSession(
                 },
                 onFailure = { error ->
                     nodeLog(
-                        "route-progress-persist-failed account=$accountId " +
+                        "route-progress-persist-failed source=${advancedContext.source} " +
+                            "account=${advancedContext.accountId} " +
                             "enterId=${advancedRoute.enterId} current=$currentBlockId " +
                             "error=${error.message ?: error::class.java.simpleName}",
                         warning = true,
