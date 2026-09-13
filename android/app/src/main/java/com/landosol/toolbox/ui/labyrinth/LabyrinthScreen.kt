@@ -101,6 +101,12 @@ fun LabyrinthScreen(
     onCaptchaError: (String) -> Unit,
     onCancelCaptcha: () -> Unit,
     onOpenStrategies: () -> Unit = {},
+    importedRouteState: com.landosol.toolbox.labyrinth.ImportedRouteUiState = com.landosol.toolbox.labyrinth.ImportedRouteUiState(),
+    onImportedText: (String) -> Unit = {},
+    onImportedGuild: (Int) -> Unit = {},
+    onSaveImported: () -> Unit = {},
+    onClearImported: () -> Unit = {},
+    onPreviewImported: () -> Unit = {},
 ) {
     var selectedTabName by rememberSaveable { mutableStateOf(LabyrinthTab.REROLL.name) }
     val selectedTab = LabyrinthTab.valueOf(selectedTabName)
@@ -216,6 +222,8 @@ fun LabyrinthScreen(
                 )
 
                 LabyrinthTab.AUTOMATION -> {
+                    ImportedRouteCard(importedRouteState, entryRecognitionState.running,
+                        onImportedText, onImportedGuild, onSaveImported, onClearImported, onPreviewImported)
                     EntryRecognitionCard(
                         state = entryRecognitionState,
                         onStart = onStartEntryRecognition,
@@ -255,6 +263,40 @@ fun LabyrinthScreen(
             onError = onCaptchaError,
             onDismiss = onCancelCaptcha,
         )
+    }
+}
+
+@Composable
+private fun ImportedRouteCard(
+    state: com.landosol.toolbox.labyrinth.ImportedRouteUiState,
+    running: Boolean, onText: (String) -> Unit, onGuild: (Int) -> Unit,
+    onSave: () -> Unit, onClear: () -> Unit, onPreview: () -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("外部路线", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(value = state.text, onValueChange = onText, enabled = !running,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 240.dp),
+                label = { Text("完整5区路线文本") }, minLines = 3)
+            Text("初始公会方案（路线文本不包含公会，请确认）")
+            com.landosol.toolbox.labyrinth.LabyrinthOpeningRosterCatalog.configs.values.forEach { config ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(selected = state.openingGuildId == config.guildId,
+                        onClick = { onGuild(config.guildId) }, enabled = !running)
+                    Text(config.guildName)
+                }
+            }
+            Button(onClick = onSave, enabled = !running) { Text("解析并保存") }
+            state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            state.saved?.let { saved ->
+                Text("路线来源：外部导入 · 区域：${saved.plan.areas.size}/5 · 节点数：${saved.plan.nodes.size} · 状态：有效")
+                Text("区域3 Boss：${saved.plan.boss(3) ?: "无"}；区域5 Boss：${saved.plan.boss(5) ?: "无"}")
+                Text("已保存方案：${com.landosol.toolbox.labyrinth.LabyrinthOpeningRosterCatalog.configs[saved.openingGuildId]?.guildName}")
+                Text("请人工停在初始角色选择0/3，再启动预演。预演不会点击或执行地图。")
+                Button(onClick = onPreview, enabled = !running) { Text("外部路线只读预演") }
+                TextButton(onClick = onClear, enabled = !running) { Text("清除外部路线") }
+            }
+        }
     }
 }
 

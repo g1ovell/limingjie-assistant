@@ -318,7 +318,23 @@ private fun LabyrinthRoute(
         }
         notificationAccount = null
     }
+    val importedRouteState by application.importedRouteController.state.collectAsStateWithLifecycle()
     LabyrinthScreen(
+        importedRouteState = importedRouteState,
+        onImportedText = application.importedRouteController::edit,
+        onImportedGuild = application.importedRouteController::selectGuild,
+        onSaveImported = application.importedRouteController::save,
+        onClearImported = application.importedRouteController::clear,
+        onPreviewImported = {
+            onRequestCapture {
+                scope.launch {
+                    application.labyrinthEntryRecognitionSession.start(
+                        dryRun = true, accountId = null,
+                        executionSourceOverride = application.importedRouteSource,
+                    )
+                }
+            }
+        },
         onOpenStrategies = { showStrategies = true; strategyMessage = null },
         state = state,
         entryRecognitionState = entryRecognitionState,

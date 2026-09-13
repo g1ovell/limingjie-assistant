@@ -212,6 +212,11 @@ class LabyrinthDebugDashboardServer(
         put("receivedFrameCount", state.receivedFrameCount)
         put("recognizedFrameCount", state.frameCount)
         put("actionCount", state.actionCount)
+        put("executionSource", state.executionSource?.name ?: JSONObject.NULL)
+        put("importedRouteAreas", state.importedRouteAreas ?: JSONObject.NULL)
+        put("plannedNextAction", state.plannedNextAction ?: JSONObject.NULL)
+        put("plannedCharacterId", state.plannedCharacterId ?: JSONObject.NULL)
+        put("openingPlanIds", JSONArray(state.openingPlanIds))
         put("message", state.message ?: JSONObject.NULL)
         put("matchedFeatures", JSONArray(result.matchedFeatures))
         put(

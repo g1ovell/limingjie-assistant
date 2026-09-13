@@ -24,10 +24,19 @@ enum class LabyrinthGameSessionRequirement {
 data class LabyrinthExecutionContext(
     val source: LabyrinthRouteSourceKind,
     val accountId: Long?,
-    val route: LabyrinthRouteJson,
-    val checkpoint: LabyrinthRerollCheckpoint,
+    val route: LabyrinthRouteJson?,
+    val checkpoint: LabyrinthRerollCheckpoint?,
     val message: String,
-)
+    val importedOpening: ImportedOpeningState? = null,
+) {
+    init {
+        require(if (source == LabyrinthRouteSourceKind.BILIBILI_NATIVE) {
+            route != null && checkpoint != null && importedOpening == null
+        } else {
+            route == null && checkpoint == null && importedOpening != null && accountId == null
+        }) { "Route source and execution state do not match" }
+    }
+}
 
 sealed interface LabyrinthExecutionContextResult {
     data class Ready(val context: LabyrinthExecutionContext) : LabyrinthExecutionContextResult
@@ -38,6 +47,8 @@ sealed interface LabyrinthExecutionContextResult {
 interface LabyrinthRouteSource {
     val source: LabyrinthRouteSourceKind
     val accountRequirement: LabyrinthAccountRequirement
+    val gameSessionRequirement: LabyrinthGameSessionRequirement
+        get() = LabyrinthGameSessionRequirement.OPTIONAL
 
     suspend fun loadExecutionContext(accountId: Long?): LabyrinthExecutionContextResult
 
@@ -97,7 +108,8 @@ class BilibiliLabyrinthRouteSource(
         currentBlockId: Long,
     ): Boolean {
         val id = context.accountId ?: return false
-        return routeStore.updateCurrentBlock(id, context.route.enterId, currentBlockId)
+        val route = context.route ?: return false
+        return routeStore.updateCurrentBlock(id, route.enterId, currentBlockId)
     }
 }
 

@@ -541,6 +541,11 @@ data class LabyrinthEntryRecognitionSessionState(
     val frameCount: Long = 0,
     val actionCount: Int = 0,
     val lastActionLabel: String? = null,
+    val executionSource: LabyrinthRouteSourceKind? = null,
+    val importedRouteAreas: Int? = null,
+    val plannedNextAction: String? = null,
+    val plannedCharacterId: String? = null,
+    val openingPlanIds: List<String> = emptyList(),
     val lastResult: LabyrinthEntryFrameResult? = null,
     val joinedCharacters: List<LabyrinthJoinedCharacter> = emptyList(),
     val observedRelics: List<LabyrinthObservedRelic> = emptyList(),
@@ -825,9 +830,10 @@ class LabyrinthEntryRecognitionSession(
     suspend fun start(
         dryRun: Boolean = true,
         accountId: Long? = null,
+        executionSourceOverride: LabyrinthRouteSource? = null,
     ): LabyrinthEntryRecognitionStartResult = mutex.withLock {
         activeSessionId?.let { return LabyrinthEntryRecognitionStartResult.AlreadyRunning(it) }
-        if (!dryRun && (actionExecutor == null || !actionsAvailable())) {
+        if ((!dryRun || executionSourceOverride != null) && (actionExecutor == null || !actionsAvailable())) {
             val reason = "无障碍服务未连接；若系统开关显示已开启，请关闭后重新开启"
             _state.value = _state.value.copy(status = LabyrinthEntryRecognitionStatus.ERROR, message = reason)
             return LabyrinthEntryRecognitionStartResult.Blocked(reason)
@@ -838,9 +844,9 @@ class LabyrinthEntryRecognitionSession(
             return LabyrinthEntryRecognitionStartResult.Blocked(reason)
         }
         var executionGateMessage: String? = null
-        val executionContext = if (!dryRun && nodeExecutionConfigured()) {
+        val executionContext = if (executionSourceOverride != null || (!dryRun && nodeExecutionConfigured())) {
             when (val result = runCatching {
-                resolveLabyrinthExecutionContext(routeSource, accountId)
+                resolveLabyrinthExecutionContext(executionSourceOverride ?: routeSource, accountId)
             }.getOrElse { failure ->
                 LabyrinthExecutionContextResult.Blocked(
                     "执行前路线来源校验失败：${failure.message ?: "未知错误"}",
@@ -860,6 +866,9 @@ class LabyrinthEntryRecognitionSession(
             }
         } else {
             null
+        }
+        if (!dryRun && executionContext?.importedOpening != null) {
+            return LabyrinthEntryRecognitionStartResult.Blocked("外部路线目前仅允许只读预演；地图定位尚未验证")
         }
         val strategySnapshot = try {
             strategyProvider?.invoke()
@@ -894,7 +903,7 @@ class LabyrinthEntryRecognitionSession(
             battleTeamSelectionPlanner = snapshot.roleRuntime?.battleTeamSelectionPlanner
         }
         val initialRunSnapshot = try {
-            runStateStore?.begin(accountId, clock())
+            if (executionContext?.importedOpening != null) null else runStateStore?.begin(accountId, clock())
         } catch (failure: Throwable) {
             sessionManager.stop(session.id)
             requestCaptureStop()
@@ -965,12 +974,14 @@ class LabyrinthEntryRecognitionSession(
         resetNodeExecutionState()
         resetExEncounterTracking()
         resetExEncounterTracking()
-        actionPlanner = if (dryRun) null else createActionPlanner()
+        actionPlanner = if (dryRun && executionContext?.importedOpening == null) null else createActionPlanner()
         relicStackLedger.seedAcquisitions(relicChoicePolicy.markStacks(initialRunSnapshot?.observedRelics.orEmpty()))
         _state.value = LabyrinthEntryRecognitionSessionState(
             status = LabyrinthEntryRecognitionStatus.RUNNING,
             sessionId = session.id,
             dryRun = dryRun,
+            executionSource = executionContext?.source,
+            importedRouteAreas = executionContext?.importedOpening?.plan?.areas?.size,
             joinedCharacters = initialRunSnapshot?.joinedCharacters.orEmpty(),
             observedRelics = initialRunSnapshot?.observedRelics.orEmpty(),
             message = if (dryRun) {
@@ -1159,7 +1170,7 @@ class LabyrinthEntryRecognitionSession(
             return
         }
         val sessionState = _state.value
-        if (!sessionState.dryRun && !actionTargetReady()) {
+        if ((!sessionState.dryRun || validatedExecutionContext?.importedOpening != null) && !actionTargetReady()) {
             val message = "等待游戏切到前台，自动会话保持运行"
             if (sessionState.message != message) {
                 _state.value = sessionState.copy(message = message)
@@ -1237,6 +1248,18 @@ class LabyrinthEntryRecognitionSession(
                 "页面识别已更新"
             },
         )
+        // Imported plans do not contain the full protocol DAG. Preview opening selection only;
+        // return before every action dispatcher, recovery flow, persistence, and map executor.
+        if (validatedExecutionContext?.importedOpening != null) {
+            val preview = importedOpeningPreview(result, timestampMillis)
+            _state.value = _state.value.copy(
+                plannedNextAction = preview.actionLabel,
+                plannedCharacterId = preview.characterId,
+                openingPlanIds = preview.rosterIds,
+                message = preview.message,
+            )
+            return
+        }
         if (
             handleSessionBlockFrame(
                 sessionId = sessionId,
@@ -1616,8 +1639,44 @@ class LabyrinthEntryRecognitionSession(
         }
     }
 
+    private data class OpeningPreview(
+        val message: String, val actionLabel: String? = null,
+        val characterId: String? = null, val rosterIds: List<String> = emptyList(),
+    )
+
+    private fun importedOpeningPreview(result: LabyrinthEntryFrameResult, timestamp: Long): OpeningPreview {
+        if (result.observation.state != LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION) {
+            return OpeningPreview("外部路线仅预演初始选人；请人工停在初始角色选择0/3")
+        }
+        val matches = result.openingCharacterMatches
+        if (matches.isEmpty() || matches.any { !it.trusted || it.characterId == null } ||
+            matches.map { it.characterId }.distinct().size != matches.size || matches.any { it.selected }) {
+            return OpeningPreview("等待可信、无重复且未选择的初始角色")
+        }
+        val policy = LabyrinthOpeningRosterCatalog.policyFor(validatedExecutionContext?.importedOpening?.openingGuildId)
+            ?: return OpeningPreview("未配置初始公会方案")
+        val roster = policy.choose(matches.mapNotNull { it.characterId }.toSet())
+        if (roster !is LabyrinthOpeningRosterDecision.Ready) return OpeningPreview("当前画面未满足既有初始方案")
+        val decision = synchronized(actionPlannerLock) {
+            actionPlanner?.decide(
+                state = result.observation.state, frameWidth = result.frameWidth,
+                frameHeight = result.frameHeight, nowMillis = timestamp,
+                anchorScores = result.observation.anchorScores, anchorMatches = result.anchorMatches,
+                openingCharacterMatches = matches, openingCharacterSelection = result.openingCharacterSelection,
+            )
+        }
+        val ids = roster.characters.map { it.characterId }
+        return if (decision is LabyrinthEntryActionDecision.Execute &&
+            decision.kind == LabyrinthEntryActionKind.SELECT_INITIAL_CHARACTER) {
+            OpeningPreview("只读预演：${decision.label}；未发送手势", decision.label, ids.first(), ids)
+        } else {
+            OpeningPreview((decision as? LabyrinthEntryActionDecision.Wait)?.reason ?: "仅预演单角色选择，不执行其他动作",
+                rosterIds = ids)
+        }
+    }
+
     private fun createActionPlanner(): LabyrinthEntryActionPlanner = actionPlannerFactory().also { planner ->
-        planner.configureOpeningRoster(validatedRoute?.guildId)
+        planner.configureOpeningRoster(validatedExecutionContext?.importedOpening?.openingGuildId ?: validatedRoute?.guildId)
         planner.start(clock())
     }
 
@@ -4748,7 +4807,7 @@ class LabyrinthEntryRecognitionSession(
         }
         actionScope.launch {
             val failure: String? = run {
-                val route = validatedRoute ?: executionContext.route
+                val route = validatedRoute ?: executionContext.route ?: return@run "当前路线不提供完整地图，不可执行节点"
                 validatedRoute = route
                 if (route.allNodes.isEmpty()) {
                     return@run "已保存路线缺少完整地图数据，请重新完成路线来源验证"
@@ -5179,7 +5238,7 @@ class LabyrinthEntryRecognitionSession(
         val currentBlockId = nodeState.currentNodeId ?: return
         val context = validatedExecutionContext ?: return
         val source = routeSource ?: return
-        val route = validatedRoute ?: context.route
+        val route = validatedRoute ?: context.route ?: return
         val advancedRoute = route.withAdvancedCurrentBlock(currentBlockId)
         if (advancedRoute == null) {
             nodeLog(

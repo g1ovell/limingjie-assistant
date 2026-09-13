@@ -213,6 +213,9 @@ class LandosolToolboxApplication : Application() {
     val database: AppDatabase by lazy { AppDatabase.create(this) }
     val labyrinthRunStateStore by lazy { RoomLabyrinthRunStateStore(database) }
     val labyrinthRouteStore by lazy { RoomLabyrinthRouteStore(database) }
+    private val importedRouteStore by lazy { com.landosol.toolbox.labyrinth.AndroidImportedRouteTextStore(this) }
+    val importedRouteController by lazy { com.landosol.toolbox.labyrinth.ImportedRouteController(importedRouteStore) }
+    val importedRouteSource by lazy { com.landosol.toolbox.labyrinth.ManualImportedLabyrinthRouteSource(importedRouteStore) }
     val labyrinthRouteSource by lazy {
         BilibiliLabyrinthRouteSource(
             routeStore = labyrinthRouteStore,

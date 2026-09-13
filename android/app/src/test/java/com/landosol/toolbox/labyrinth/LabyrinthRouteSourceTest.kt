@@ -32,7 +32,7 @@ class LabyrinthRouteSourceTest {
         val context = (result as LabyrinthExecutionContextResult.Ready).context
         assertEquals(LabyrinthRouteSourceKind.BILIBILI_NATIVE, context.source)
         assertEquals(42L, context.accountId)
-        assertEquals(validRoute().enterId, context.route.enterId)
+        assertEquals(validRoute().enterId, requireNotNull(context.route).enterId)
         assertTrue(context.message.contains("Enter ID"))
     }
 
@@ -103,8 +103,14 @@ class LabyrinthRouteSourceTest {
                 LabyrinthExecutionContext(
                     source = source,
                     accountId = accountId,
-                    route = currentRoute,
-                    checkpoint = currentCheckpoint,
+                    route = null,
+                    checkpoint = null,
+                    importedOpening = ImportedOpeningState(
+                        ImportedRoutePlan(currentRoute.nodes.map {
+                            ImportedRouteNode(it.area, it.column, ImportedBranch.MERGED, ImportedNodeType.START)
+                        }),
+                        openingGuildId = currentCheckpoint.guildId,
+                    ),
                     message = "测试来源已提供可执行路线",
                 ),
             )
