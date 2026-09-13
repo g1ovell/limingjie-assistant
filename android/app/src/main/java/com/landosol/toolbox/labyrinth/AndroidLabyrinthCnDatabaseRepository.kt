@@ -71,7 +71,7 @@ class AndroidLabyrinthCnDatabaseRepository(
             if (!candidate.isFile || candidate.length() < SQLITE_HEADER.size) {
                 return LabyrinthCnDatabaseValidation.Invalid("文件不存在或为空")
             }
-            val header = candidate.inputStream().use { it.readNBytes(SQLITE_HEADER.size) }
+            val header = candidate.inputStream().use { it.readUpTo(SQLITE_HEADER.size) }
             if (!header.contentEquals(SQLITE_HEADER)) {
                 return LabyrinthCnDatabaseValidation.Invalid("文件头不是SQLite format 3")
             }

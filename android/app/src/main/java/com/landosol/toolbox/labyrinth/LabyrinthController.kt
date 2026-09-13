@@ -128,7 +128,7 @@ class LabyrinthController(
     private val accountRepository: AccountRepository,
     private val sessionRegistry: GameSessionRegistry,
     private val database: AppDatabase,
-    private val loginCoordinator: BilibiliNativeLoginCoordinator,
+    private val loginCoordinatorProvider: () -> BilibiliNativeLoginCoordinator?,
     private val settingsStore: LabyrinthRerollSettingsStore,
     private val launchForeground: () -> Unit,
 ) {
@@ -150,7 +150,7 @@ class LabyrinthController(
             }.distinctUntilChanged().collect { selectedAccountId ->
                 if (selectedAccountId != settingsAccountId) {
                     runningJob?.cancelAndJoin()
-                    chrome.value.captcha?.let { loginCoordinator.cancel(it.accountId) }
+                    chrome.value.captcha?.let { loginCoordinatorProvider()?.cancel(it.accountId) }
                     frozenStart = null
                     startRequested = false
                     pendingLoginAction = null
@@ -561,6 +561,7 @@ class LabyrinthController(
     fun submitCaptcha(validate: String) {
         val captcha = chrome.value.captcha ?: return
         if (chrome.value.isWorking) return
+        val loginCoordinator = resolveLoginCoordinator() ?: return
         chrome.update { it.copy(isWorking = true, message = null) }
         runningJob = scope.launch {
             chrome.update { it.copy(isWorking = true, message = null) }
@@ -624,7 +625,7 @@ class LabyrinthController(
         startRequested = false
         pendingLoginAction = null
         scope.launch {
-            loginCoordinator.cancel(accountId)
+            loginCoordinatorProvider()?.cancel(accountId)
             if (settingsAccountId == accountId) {
                 pendingLoginAction = null
                 chrome.update { it.copy(captcha = null, isWorking = false, message = "已取消本次登录验证") }
@@ -706,11 +707,17 @@ class LabyrinthController(
         )
     }
 
+    private fun resolveLoginCoordinator(): BilibiliNativeLoginCoordinator? =
+        loginCoordinatorProvider().also { coordinator ->
+            if (coordinator == null) reportMessage("未检测到 Bilibili 渠道《公主连结》客户端")
+        }
+
     private suspend fun ensureGameSession(
         account: AccountListItem,
         action: PendingLoginAction,
     ): BilibiliGameSession? {
         sessionRegistry.read(account.id)?.let { return it }
+        val loginCoordinator = resolveLoginCoordinator() ?: return null
         chrome.update { it.copy(progress = "正在从账号库登录游戏服", message = null) }
         val material = runCatching { accountRepository.loadLoginMaterial(account.id) }
             .getOrElse { failure ->

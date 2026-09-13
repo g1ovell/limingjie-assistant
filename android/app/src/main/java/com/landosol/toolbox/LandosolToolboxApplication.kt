@@ -2,6 +2,7 @@ package com.landosol.toolbox
 
 import android.app.Application
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.util.Log
 import com.landosol.toolbox.account.AccountRepository
 import com.landosol.toolbox.automation.AutomationAction
@@ -231,8 +232,16 @@ class LandosolToolboxApplication : Application() {
     }
     val labyrinthController by lazy {
         com.landosol.toolbox.labyrinth.LabyrinthController(
-            accountRepository, gameSessionRegistry, database, bilibiliNativeLoginCoordinator,
-            com.landosol.toolbox.labyrinth.AndroidLabyrinthRerollSettingsStore(this),
+            accountRepository, gameSessionRegistry, database,
+            loginCoordinatorProvider = {
+                // 首页不解析渠道依赖；未安装客户端是功能前置条件，不是启动异常。
+                try {
+                    bilibiliNativeLoginCoordinator
+                } catch (_: PackageManager.NameNotFoundException) {
+                    null
+                }
+            },
+            settingsStore = com.landosol.toolbox.labyrinth.AndroidLabyrinthRerollSettingsStore(this),
             launchForeground = { com.landosol.toolbox.labyrinth.LabyrinthRerollService.start(this) },
         )
     }
