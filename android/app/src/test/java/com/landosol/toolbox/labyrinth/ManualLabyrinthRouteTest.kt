@@ -127,15 +127,30 @@ class ManualLabyrinthRouteTest {
             assertEquals(0, gestures)
         } finally { session.stop() }
     }
-    @Test fun `external source cannot start live automation`() = runTest {
+    @Test fun `external source live start is allowed only as an opening capability session`() = runTest {
         val manager = AutomationSessionManager()
+        var gestures = 0
         val session = LabyrinthEntryRecognitionSession(
-            sessionManager = manager, captureActive = { true }, processorFactory = { error("must not load") },
-            actionExecutor = SessionBoundActionExecutor(manager) { error("must never dispatch") },
+            sessionManager = manager, captureActive = { true }, processorFactory = { { error("no frames in gate test") } },
+            actionExecutor = SessionBoundActionExecutor(manager) { gestures++; error("opening frame gate must run first") },
+            actionsAvailable = { true },
         )
         val result = session.start(dryRun = false, executionSourceOverride = ManualImportedLabyrinthRouteSource(MemoryStore().apply { write(sample(), 5) }))
-        assertTrue(result is LabyrinthEntryRecognitionStartResult.Blocked)
-        assertNull(manager.current())
+        assertTrue(result.toString(), result is LabyrinthEntryRecognitionStartResult.Started)
+        assertEquals(false, manager.current()!!.dryRun)
+        val process = session.javaClass.declaredMethods.single { it.name.startsWith("processFrameResult") }
+            .apply { isAccessible = true }
+        val mapFrame = LabyrinthEntryFrameResult(
+            observation = LabyrinthEntryPageObservation(
+                LabyrinthEntryPageState.NODE_SELECTION, 0.99, emptyMap(),
+                LabyrinthAnchorScores(emptyMap()),
+            ), matchedFeatures = emptyList(), elapsedMillis = 10, frameWidth = 1920, frameHeight = 1080,
+        )
+        process.invoke(session, manager.current()!!.id.value, mapFrame, 1920, 1080, System.currentTimeMillis())
+        assertEquals(0, gestures)
+        assertEquals(0, session.state.value.actionCount)
+        assertTrue(session.state.value.message?.contains("地图执行仍被禁止") == true)
+        session.stop()
     }
     private class MemoryStore : ImportedRouteTextStore {
         private var saved: Pair<String, Int>? = null

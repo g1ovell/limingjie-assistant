@@ -546,6 +546,8 @@ data class LabyrinthEntryRecognitionSessionState(
     val plannedNextAction: String? = null,
     val plannedCharacterId: String? = null,
     val openingPlanIds: List<String> = emptyList(),
+    val openingTarget: ImportedOpeningTapTarget? = null,
+    val openingGestureDispatched: Boolean = false,
     val lastResult: LabyrinthEntryFrameResult? = null,
     val joinedCharacters: List<LabyrinthJoinedCharacter> = emptyList(),
     val observedRelics: List<LabyrinthObservedRelic> = emptyList(),
@@ -631,6 +633,10 @@ class LabyrinthEntryRecognitionSession(
     private var firstFrameWatchdog: Job? = null
     private var lastProcessedAt = Long.MIN_VALUE
     private var actionPlanner: LabyrinthEntryActionPlanner? = null
+    @Volatile
+    private var importedOpeningLiveTapDispatched = false
+    @Volatile
+    private var pendingImportedOpeningTapTarget: ImportedOpeningTapTarget? = null
     @Volatile
     private var validatedExecutionContext: LabyrinthExecutionContext? = null
     private var validatedRoute: LabyrinthRouteJson? = null
@@ -867,9 +873,6 @@ class LabyrinthEntryRecognitionSession(
         } else {
             null
         }
-        if (!dryRun && executionContext?.importedOpening != null) {
-            return LabyrinthEntryRecognitionStartResult.Blocked("外部路线目前仅允许只读预演；地图定位尚未验证")
-        }
         val strategySnapshot = try {
             strategyProvider?.invoke()
         } catch (failure: Exception) {
@@ -974,6 +977,8 @@ class LabyrinthEntryRecognitionSession(
         resetNodeExecutionState()
         resetExEncounterTracking()
         resetExEncounterTracking()
+        importedOpeningLiveTapDispatched = false
+        pendingImportedOpeningTapTarget = null
         actionPlanner = if (dryRun && executionContext?.importedOpening == null) null else createActionPlanner()
         relicStackLedger.seedAcquisitions(relicChoicePolicy.markStacks(initialRunSnapshot?.observedRelics.orEmpty()))
         _state.value = LabyrinthEntryRecognitionSessionState(
@@ -1020,7 +1025,7 @@ class LabyrinthEntryRecognitionSession(
             return LabyrinthEntryRecognitionStartResult.Blocked(reason)
         }
         armFirstFrameWatchdog(session.id)
-        if (!dryRun && !gameLauncher()) {
+        if (!dryRun && executionContext?.importedOpening == null && !gameLauncher()) {
             firstFrameWatchdog?.cancel()
             firstFrameWatchdog = null
             lease?.let(CaptureFrameBus::unregister)
@@ -1248,9 +1253,10 @@ class LabyrinthEntryRecognitionSession(
                 "页面识别已更新"
             },
         )
-        // Imported plans do not contain the full protocol DAG. Preview opening selection only;
-        // return before every action dispatcher, recovery flow, persistence, and map executor.
-        if (validatedExecutionContext?.importedOpening != null) {
+        // Imported plans do not contain the full protocol DAG. Dry-run previews opening selection;
+        // live mode has a separately gated single opening tap and returns before persistence,
+        // recovery, route handoff, or map execution.
+        if (validatedExecutionContext?.importedOpening != null && current.dryRun) {
             val preview = importedOpeningPreview(result, timestampMillis)
             _state.value = _state.value.copy(
                 plannedNextAction = preview.actionLabel,
@@ -1258,6 +1264,32 @@ class LabyrinthEntryRecognitionSession(
                 openingPlanIds = preview.rosterIds,
                 message = preview.message,
             )
+            return
+        }
+        if (validatedExecutionContext?.importedOpening != null && !current.dryRun) {
+            if (importedOpeningLiveTapDispatched) return
+            val opening = validatedExecutionContext?.importedOpening ?: return
+            when (val gate = ImportedOpeningLiveActionGate.resolve(result, opening.openingGuildId)) {
+                is ImportedOpeningLiveActionResult.Rejected -> {
+                    _state.value = _state.value.copy(
+                        plannedNextAction = null,
+                        plannedCharacterId = null,
+                        message = gate.reason,
+                    )
+                    return
+                }
+                is ImportedOpeningLiveActionResult.Allowed -> {
+                    pendingImportedOpeningTapTarget = gate.target
+                    _state.value = _state.value.copy(
+                        plannedNextAction = "选择初始角色1/3：${gate.target.displayName}",
+                        plannedCharacterId = gate.target.characterId,
+                        openingPlanIds = gate.rosterIds,
+                        openingTarget = gate.target,
+                        message = "已通过单次初始选人动作安全门，等待现有策略派发",
+                    )
+                }
+            }
+            handleActionDecision(sessionId, result, frameWidth, frameHeight, timestampMillis)
             return
         }
         if (
@@ -2696,6 +2728,20 @@ class LabyrinthEntryRecognitionSession(
         decision: LabyrinthEntryActionDecision.Execute,
     ) {
         if (!actionInFlight.compareAndSet(false, true)) return
+        val importedOpeningLive = validatedExecutionContext?.importedOpening != null && !_state.value.dryRun
+        if (importedOpeningLive) {
+            val target = pendingImportedOpeningTapTarget
+            val tap = decision.action as? AutomationAction.Tap
+            if (
+                importedOpeningLiveTapDispatched ||
+                decision.kind != LabyrinthEntryActionKind.SELECT_INITIAL_CHARACTER ||
+                target == null || tap == null || tap.point != target.tapPoint
+            ) {
+                actionInFlight.set(false)
+                _state.value = _state.value.copy(message = "外部路线单次初始选人安全门拒绝非目标动作")
+                return
+            }
+        }
         actionScope.launch {
             val executor = actionExecutor
             val result = if (executor == null) {
@@ -2705,6 +2751,9 @@ class LabyrinthEntryRecognitionSession(
             }
             when (result) {
                 is AutomationActionResult.Executed -> {
+                    if (importedOpeningLive) {
+                        importedOpeningLiveTapDispatched = true
+                    }
                     if (decision.kind == LabyrinthEntryActionKind.RESUME_DAWN_REALM) {
                         // The next page may be the node map, a choice page, or an unfinished
                         // CHARACTER_JOINED reward from before the app/session was restarted.
@@ -2715,12 +2764,17 @@ class LabyrinthEntryRecognitionSession(
                         _state.value = current.copy(
                             actionCount = current.actionCount + 1,
                             lastActionLabel = decision.label,
+                            openingGestureDispatched = current.openingGestureDispatched || importedOpeningLive,
                             message = "已执行：${decision.label}",
                         )
                         overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
                     }
                 }
                 is AutomationActionResult.Rejected -> {
+                    if (importedOpeningLive) {
+                        stop("初始角色单次手势被拒绝：${result.reason}")
+                        return@launch
+                    }
                     if (decision.kind == LabyrinthEntryActionKind.RESUME_DAWN_REALM) {
                         existingRunResumeHandoffArmed = false
                     }
@@ -2734,8 +2788,12 @@ class LabyrinthEntryRecognitionSession(
                     }
                 }
                 AutomationActionResult.StaleSession -> Unit
-                AutomationActionResult.Paused -> Unit
-                is AutomationActionResult.DryRun -> Unit
+                AutomationActionResult.Paused -> if (importedOpeningLive) {
+                    stop("初始角色单次手势未执行：会话已暂停")
+                }
+                is AutomationActionResult.DryRun -> if (importedOpeningLive) {
+                    stop("初始角色单次手势未执行：后端返回Dry Run")
+                }
             }
             actionInFlight.set(false)
         }

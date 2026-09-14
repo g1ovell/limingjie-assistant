@@ -217,6 +217,23 @@ class LabyrinthDebugDashboardServer(
         put("plannedNextAction", state.plannedNextAction ?: JSONObject.NULL)
         put("plannedCharacterId", state.plannedCharacterId ?: JSONObject.NULL)
         put("openingPlanIds", JSONArray(state.openingPlanIds))
+        put("openingGestureDispatched", state.openingGestureDispatched)
+        put(
+            "openingTarget",
+            state.openingTarget?.let { target ->
+                JSONObject().apply {
+                    put("characterId", target.characterId)
+                    put("displayName", target.displayName)
+                    put("slotId", target.slotId)
+                    put("left", target.screenRect.left)
+                    put("top", target.screenRect.top)
+                    put("width", target.screenRect.width)
+                    put("height", target.screenRect.height)
+                    put("tapX", target.tapPoint.x.toDouble())
+                    put("tapY", target.tapPoint.y.toDouble())
+                }
+            } ?: JSONObject.NULL,
+        )
         put("message", state.message ?: JSONObject.NULL)
         put("matchedFeatures", JSONArray(result.matchedFeatures))
         put(

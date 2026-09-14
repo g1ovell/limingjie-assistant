@@ -335,6 +335,16 @@ private fun LabyrinthRoute(
                 }
             }
         },
+        onRunImportedOpeningTap = {
+            onRequestCapture {
+                scope.launch {
+                    application.labyrinthEntryRecognitionSession.start(
+                        dryRun = false, accountId = null,
+                        executionSourceOverride = application.importedRouteSource,
+                    )
+                }
+            }
+        },
         onOpenStrategies = { showStrategies = true; strategyMessage = null },
         state = state,
         entryRecognitionState = entryRecognitionState,

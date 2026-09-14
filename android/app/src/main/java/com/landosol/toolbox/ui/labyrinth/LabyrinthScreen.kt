@@ -107,6 +107,7 @@ fun LabyrinthScreen(
     onSaveImported: () -> Unit = {},
     onClearImported: () -> Unit = {},
     onPreviewImported: () -> Unit = {},
+    onRunImportedOpeningTap: () -> Unit = {},
 ) {
     var selectedTabName by rememberSaveable { mutableStateOf(LabyrinthTab.REROLL.name) }
     val selectedTab = LabyrinthTab.valueOf(selectedTabName)
@@ -223,7 +224,8 @@ fun LabyrinthScreen(
 
                 LabyrinthTab.AUTOMATION -> {
                     ImportedRouteCard(importedRouteState, entryRecognitionState.running,
-                        onImportedText, onImportedGuild, onSaveImported, onClearImported, onPreviewImported)
+                        onImportedText, onImportedGuild, onSaveImported, onClearImported,
+                        onPreviewImported, onRunImportedOpeningTap)
                     EntryRecognitionCard(
                         state = entryRecognitionState,
                         onStart = onStartEntryRecognition,
@@ -271,6 +273,7 @@ private fun ImportedRouteCard(
     state: com.landosol.toolbox.labyrinth.ImportedRouteUiState,
     running: Boolean, onText: (String) -> Unit, onGuild: (Int) -> Unit,
     onSave: () -> Unit, onClear: () -> Unit, onPreview: () -> Unit,
+    onRunOpeningTap: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -294,6 +297,10 @@ private fun ImportedRouteCard(
                 Text("已保存方案：${com.landosol.toolbox.labyrinth.LabyrinthOpeningRosterCatalog.configs[saved.openingGuildId]?.guildName}")
                 Text("请人工停在初始角色选择0/3，再启动预演。预演不会点击或执行地图。")
                 Button(onClick = onPreview, enabled = !running) { Text("外部路线只读预演") }
+                Button(onClick = onRunOpeningTap, enabled = !running) {
+                    Text("外部路线单次初始选人")
+                }
+                Text("仅允许识别后发送一次角色选择点击；地图、战斗和后续动作保持禁止。")
                 TextButton(onClick = onClear, enabled = !running) { Text("清除外部路线") }
             }
         }
