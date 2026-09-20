@@ -14,6 +14,7 @@ internal class LabyrinthBattleWaitPolicy {
         if (startedAt == null) {
             startedAt = now
             startPageGrace = true
+            android.util.Log.i(LOG_TAG, "armed at $now")
         }
     }
 
@@ -30,22 +31,34 @@ internal class LabyrinthBattleWaitPolicy {
             LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
             LabyrinthEntryPageState.PRE_HOME_DATA_LOADING,
             LabyrinthEntryPageState.BATTLE_IN_PROGRESS -> true
-            // Permit a short stale editor frame after injection, but do not hide a failed start.
-            LabyrinthEntryPageState.BATTLE_TEAM_SELECTION -> startPageGrace && elapsed < 3_000L
+            // Permit a short stale editor/challenge frame after injection, but do not hide a failed start.
+            LabyrinthEntryPageState.BATTLE_TEAM_SELECTION,
+            LabyrinthEntryPageState.BATTLE_CHALLENGE -> startPageGrace && elapsed < 3_000L
             else -> false
         }
         if (!waitingPage) {
+            android.util.Log.i(LOG_TAG, "cleared by page ${page.name} after ${elapsed}ms")
             reset()
             return LabyrinthBattleWaitDecision.NONE
         }
-        if (page != LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) startPageGrace = false
+        if (page != LabyrinthEntryPageState.BATTLE_TEAM_SELECTION &&
+            page != LabyrinthEntryPageState.BATTLE_CHALLENGE
+        ) startPageGrace = false
         return if (elapsed >= 300_000L) LabyrinthBattleWaitDecision.TIMED_OUT
         else LabyrinthBattleWaitDecision.WAIT
     }
 
     @Synchronized
     fun reset() {
+        if (startedAt != null) {
+            val caller = Throwable().stackTrace.getOrNull(1)?.let { "${it.fileName}:${it.lineNumber}" }
+            android.util.Log.i(LOG_TAG, "reset while armed, caller=$caller")
+        }
         startedAt = null
         startPageGrace = false
+    }
+
+    private companion object {
+        const val LOG_TAG = "LabyrinthBattleWait"
     }
 }

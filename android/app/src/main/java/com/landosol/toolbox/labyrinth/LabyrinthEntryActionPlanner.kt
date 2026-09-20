@@ -18,6 +18,11 @@ data class LabyrinthEntryActionPlannerConfig(
     val manualCharacterSelection: Boolean = false,
     val requireConfiguredOpeningRoster: Boolean = false,
     val pageActionIntervalMillis: Long = 1_200L,
+    /**
+     * 标题页点一下后，渠道服（小米 SDK）冷启动要先走一遍 SDK 登录，标题画面会原地停留 10 秒以上。
+     * 若沿用 1.2 秒间隔，3 次尝试在 4 秒内耗尽，会被判成「动作连续失败」而停机。
+     */
+    val titleTapIntervalMillis: Long = 5_000L,
     val dawnRealmActionIntervalMillis: Long = 8_000L,
     val preAnnouncementClickIntervalMillis: Long = 900L,
     val maxPageActionAttempts: Int = 3,
@@ -220,6 +225,7 @@ class LabyrinthEntryActionPlanner(
                 LabyrinthEntryActionKind.TITLE_CONTINUE,
                 "点击标题页继续",
                 TITLE_CONTINUE,
+                actionIntervalMillis = config.titleTapIntervalMillis,
                 anchorMatches = anchorMatches,
                 anchorIds = listOf(EntryAnchorId.TITLE_TAP_PROMPT),
             ).also { decision ->

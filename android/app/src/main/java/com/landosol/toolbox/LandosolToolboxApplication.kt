@@ -6,6 +6,10 @@ import android.util.Log
 import com.landosol.toolbox.account.AccountRepository
 import com.landosol.toolbox.automation.AutomationAction
 import com.landosol.toolbox.automation.AutomationSessionManager
+import com.landosol.toolbox.automation.GameChannel
+import com.landosol.toolbox.automation.GameClientLaunchGate
+import com.landosol.toolbox.automation.GameClientProfileResolver
+import com.landosol.toolbox.automation.GameClientResolution
 import com.landosol.toolbox.automation.ScreenPoint
 import com.landosol.toolbox.automation.SessionBoundActionExecutor
 import com.landosol.toolbox.automation.accessibility.AndroidAccessibilityActionBackend
@@ -74,6 +78,17 @@ class LandosolToolboxApplication : Application() {
         // First line of every process log, so a diagnostic bundle always names the build it came
         // from even when the interesting part of the run happened much later.
         Log.i(APP_LOG_TAG, "黎明界助手启动：${AppVersion.display}")
+        // 渠道识别结果写进进程首屏日志，便于用 logcat 直接验证多包适配是否生效。
+        Log.i(APP_LOG_TAG, "游戏客户端渠道：${gameClientProfile ?: "未识别（零安装或双安装歧义）"}")
+        Log.i(APP_LOG_TAG, "游戏协议版本：APP-VER=${gameClientVersionName ?: "未知"}")
+        Log.i(
+            APP_LOG_TAG,
+            "登录模式：" + if (gameClientProfile?.channel == GameChannel.XIAOMI) {
+                "渠道服凭据直通（账号=uid，密码=access_key）"
+            } else {
+                "B 服 SDK 登录"
+            },
+        )
         // The dashboard is loopback-only, so it is safe to start for test/release APKs too.
         // Starting it here also makes http://127.0.0.1:8765/ immediately reachable from a
         // browser running inside the emulator, before the first recognition session starts.
@@ -94,7 +109,39 @@ class LandosolToolboxApplication : Application() {
     val automationOverlayCoordinator by lazy {
         AutomationOverlayCoordinator(AndroidAutomationNotificationHost(this))
     }
-    private val accessibilityActionBackend by lazy { AndroidAccessibilityActionBackend() }
+    /**
+     * 渠道识别：只认已确认的 B 服 / 小米两包。零安装与双安装歧义均拒绝，
+     * 不随机选渠道。解析在首次取用时进行，构造 Application 时不查包。
+     */
+    private val gameClientProfile by lazy {
+        when (val resolution = GameClientProfileResolver.resolve(packageManager)) {
+            is GameClientResolution.Available -> resolution.profile
+            else -> null
+        }
+    }
+
+    /** 已确认的游戏包名；解析失败为 null。 */
+    private val gamePackageName: String?
+        get() = gameClientProfile?.packageName
+
+    /** 协议层 APP-VER 使用的游戏包版本；读不到为 null。 */
+    private val gameClientVersionName: String?
+        get() = gamePackageName?.let { packageName ->
+            runCatching { packageManager.getPackageInfo(packageName, 0).versionName }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+        }
+
+    /**
+     * 供前台校验使用的目标包名。解析失败时返回永不匹配的占位包名，
+     * 让动作稳定走 Rejected —— 绝不退化成 expectedPackageName=null（等于关闭校验）。
+     */
+    private val actionTargetPackageName: String
+        get() = gamePackageName ?: NO_GAME_CLIENT_SENTINEL
+
+    private val accessibilityActionBackend by lazy {
+        AndroidAccessibilityActionBackend(actionTargetPackageName)
+    }
     val automationActionExecutor by lazy {
         SessionBoundActionExecutor(automationSessionManager, accessibilityActionBackend)
     }
@@ -180,7 +227,8 @@ class LandosolToolboxApplication : Application() {
             actionExecutor = automationActionExecutor,
             actionsAvailable = LandosolAccessibilityService::isConnected,
             actionTargetReady = {
-                LandosolAccessibilityService.foregroundPackage() == GAME_PACKAGE_NAME
+                val target = gamePackageName
+                target != null && LandosolAccessibilityService.foregroundPackage() == target
             },
             actionPlannerFactory = {
                 LabyrinthEntryActionPlanner(
@@ -217,14 +265,40 @@ class LandosolToolboxApplication : Application() {
                 }
             },
             gameLauncher = gameLauncher@{
-                val intent = packageManager.getLaunchIntentForPackage(GAME_PACKAGE_NAME)
-                    ?: return@gameLauncher false
-                runCatching {
-                    startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                }.isSuccess
+                val target = gamePackageName ?: return@gameLauncher false
+                // 游戏已在 MainActivity 前台时绝不重发启动 Intent：
+                // 重发会拉起 SplashActivity → PCR 自身弹出 PermissionActivity →
+                // MainActivity 被 stop、Surface 消失 → 黑屏（交接文档 6.3 节已记载）。
+                val foregroundActivity = LandosolAccessibilityService.foregroundActivity()
+                val decision = GameClientLaunchGate.decide(
+                    targetPackage = target,
+                    foregroundPackage = LandosolAccessibilityService.foregroundPackage(),
+                    activity = foregroundActivity,
+                )
+                Log.i(APP_LOG_TAG, "游戏启动决策：$decision 前台Activity=$foregroundActivity")
+                GameClientLaunchGate.execute(decision) {
+                    val intent = gameLaunchIntent(target)
+                    if (intent == null) {
+                        false
+                    } else {
+                        runCatching { startActivity(intent) }.isSuccess
+                    }
+                }
             },
         )
     }
+
+    /**
+     * 游戏启动 Intent。必须清掉 getLaunchIntentForPackage 塞进去的 package 字段：
+     * 桌面启动器建的任务其 Intent 没有 package，Android 用 filterEquals 比对时只要
+     * package 不等就判定「不是同一个入口」，于是在既有任务顶上再建一个 SplashActivity，
+     * PCR 随即弹 PermissionActivity 压在活着的 MainActivity 上且永不退出 —— 即小米黑屏。
+     * 清掉 package 后系统走 START_TASK_TO_FRONT，只把任务提前，不新建 Activity（adb 实测）。
+     */
+    private fun gameLaunchIntent(target: String): Intent? =
+        packageManager.getLaunchIntentForPackage(target)
+            ?.setPackage(null)
+            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     val database: AppDatabase by lazy { AppDatabase.create(this) }
     val labyrinthRunStateStore by lazy { RoomLabyrinthRunStateStore(database) }
     val labyrinthRouteStore by lazy { RoomLabyrinthRouteStore(database) }
@@ -237,11 +311,23 @@ class LandosolToolboxApplication : Application() {
     }
     val bilibiliNativeLoginCoordinator: BilibiliNativeLoginCoordinator by lazy {
         BilibiliNativeLoginCoordinator(
-            sdkCoordinator = bilibiliSdkLoginCoordinator,
-            sdkGateway = bilibiliSdkGateway,
+            sdkCoordinatorProvider = { bilibiliSdkLoginCoordinator },
+            sdkGatewayProvider = { bilibiliSdkGateway },
             sessionStore = sessionStore,
-            gameGateway = BilibiliGameGatewayFactory.create(this),
+            gameGateway = BilibiliGameGatewayFactory.create(
+                this,
+                gamePackageName ?: error("未识别游戏渠道，无法建立游戏协议网关"),
+                // 渠道服走独立网关（l1-prod-uo），与 B 服不是同一套服务器。
+                if (gameClientProfile?.channel == GameChannel.XIAOMI) {
+                    BilibiliGameGatewayFactory.ChannelEndpoint.CHANNEL_UO
+                } else {
+                    BilibiliGameGatewayFactory.ChannelEndpoint.BILIBILI
+                },
+            ),
             gameSessionRegistry = gameSessionRegistry,
+            // 小米渠道没有可用的 B 服 SDK 登录链：账号页填写的
+            // uid / access_key 直通游戏服，不走第一层。
+            directCredentials = gameClientProfile?.channel == GameChannel.XIAOMI,
         )
     }
     val accountRepository: AccountRepository by lazy {
@@ -249,7 +335,7 @@ class LandosolToolboxApplication : Application() {
     }
     val labyrinthController by lazy {
         com.landosol.toolbox.labyrinth.LabyrinthController(
-            accountRepository, gameSessionRegistry, database, bilibiliNativeLoginCoordinator,
+            accountRepository, gameSessionRegistry, database, { bilibiliNativeLoginCoordinator },
             com.landosol.toolbox.labyrinth.AndroidLabyrinthRerollSettingsStore(this),
             launchForeground = { com.landosol.toolbox.labyrinth.LabyrinthRerollService.start(this) },
         )
@@ -274,7 +360,7 @@ class LandosolToolboxApplication : Application() {
     val gameSessionResetWorkflow by lazy {
         val frameTracker = SessionExpiryFrameTracker()
         val presence = AccessibilityForegroundPresenceObserver(
-            gamePackageName = GAME_PACKAGE_NAME,
+            gamePackageName = actionTargetPackageName,
             foregroundPackage = LandosolAccessibilityService::foregroundPackage,
         )
         // After a server-side reroll the client still holds the previous run's local state.
@@ -303,11 +389,11 @@ class LandosolToolboxApplication : Application() {
             backend = CompositeSessionResetBackend(
                 terminator = terminator,
                 relauncher = Relauncher {
-                    val intent = packageManager.getLaunchIntentForPackage(GAME_PACKAGE_NAME)
+                    val target = gamePackageName
                         ?: return@Relauncher GameClientRelaunchResult.LAUNCH_UNAVAILABLE
-                    runCatching {
-                        startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    }.isSuccess.let { launched ->
+                    val intent = gameLaunchIntent(target)
+                        ?: return@Relauncher GameClientRelaunchResult.LAUNCH_UNAVAILABLE
+                    runCatching { startActivity(intent) }.isSuccess.let { launched ->
                         if (launched) GameClientRelaunchResult.LAUNCH_REQUESTED
                         else GameClientRelaunchResult.LAUNCH_UNAVAILABLE
                     }
@@ -517,7 +603,14 @@ class LandosolToolboxApplication : Application() {
         )
         const val APP_LOG_TAG = "LandosolToolbox"
         const val DATABASE_UPDATE_LOG_TAG = "LabyrinthCnDatabase"
+        @Suppress("unused")
         const val GAME_PACKAGE_NAME = "com.bilibili.priconne"
+
+        /**
+         * 渠道解析失败（零安装 / 双安装歧义）时的占位包名。
+         * 它不会等于任何真实前台包，因此前台校验恒为 false。
+         */
+        const val NO_GAME_CLIENT_SENTINEL = "com.landosol.toolbox.no-game-client"
         /** 旧触发点「冒险→黎明界」。已弃用：刷开局后会进入无识别的公会选择页。 */
         @Suppress("unused")
         val SESSION_EXPIRY_TRIGGER_POINT = ScreenPoint(1735f, 805f)

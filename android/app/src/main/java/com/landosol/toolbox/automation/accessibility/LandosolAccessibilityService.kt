@@ -63,14 +63,20 @@ class LandosolAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (shouldRefreshForegroundWindow(event.eventType)) {
             val eventPackageName = event.packageName?.toString()
+            val eventClassName = event.className?.toString()
             if (
                 shouldTrackForegroundWindow(
                     servicePackageName = packageName,
                     eventPackageName = eventPackageName,
-                    eventClassName = event.className?.toString(),
+                    eventClassName = eventClassName,
                 )
             ) {
                 foregroundPackageName = eventPackageName
+                // 只有窗口状态变化事件携带 Activity 类名；内容变化事件给的是 View 类名，
+                // 拿它覆盖会把 MainActivity 冲掉，导致启动闸门误判。
+                if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                    foregroundActivityName = eventClassName
+                }
             }
         }
     }
@@ -89,6 +95,7 @@ class LandosolAccessibilityService : AccessibilityService() {
         if (activeService === this) {
             activeService = null
             foregroundPackageName = null
+            foregroundActivityName = null
             AccessibilityConnectionRegistry.update(false)
         }
         return super.onUnbind(intent)
@@ -98,6 +105,7 @@ class LandosolAccessibilityService : AccessibilityService() {
         if (activeService === this) {
             activeService = null
             foregroundPackageName = null
+            foregroundActivityName = null
             AccessibilityConnectionRegistry.update(false)
         }
         super.onDestroy()
@@ -239,12 +247,19 @@ class LandosolAccessibilityService : AccessibilityService() {
         @Volatile
         private var foregroundPackageName: String? = null
 
+        /** 前台 Activity 类名，仅由 TYPE_WINDOW_STATE_CHANGED 更新。 */
+        @Volatile
+        private var foregroundActivityName: String? = null
+
         internal fun current(): LandosolAccessibilityService? = activeService
         fun isConnected(): Boolean = activeService != null && AccessibilityConnectionRegistry.isConnected()
         internal fun foregroundPackage(): String? {
             activeService?.refreshForegroundPackageFromRoot()
             return foregroundPackageName
         }
+
+        /** 前台 Activity 类名；未观察到窗口状态变化时为 null。 */
+        internal fun foregroundActivity(): String? = foregroundActivityName
 
         /** 通过无障碍全局动作派发（例如最近任务），返回是否被系统接受 */
         suspend fun dispatchGlobalAction(action: Int): Boolean = onMainThreadCompat {

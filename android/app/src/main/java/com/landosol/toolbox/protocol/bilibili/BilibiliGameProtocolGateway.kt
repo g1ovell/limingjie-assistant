@@ -1,5 +1,6 @@
 package com.landosol.toolbox.protocol.bilibili
 
+import android.util.Log
 import java.io.IOException
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -29,6 +30,10 @@ class BilibiliGameProtocolGateway(
     private val crypto: GameProtocolCrypto = GameProtocolCrypto(),
     private val json: Json = Json { ignoreUnknownKeys = true },
     private val campaignRandom: SecureRandom = SecureRandom(),
+    /** sdk_login 的 platform；2=Android。 */
+    private val loginPlatform: String = "2",
+    /** sdk_login 的 channel；1=B 服。渠道服需按实际渠道号调整。 */
+    private val loginChannel: String = "1",
 ) : BilibiliGameGateway {
     override suspend fun loginAndLoadProfile(
         sdkSession: SdkSession,
@@ -40,8 +45,24 @@ class BilibiliGameProtocolGateway(
             headers = profile.headers.toMutableMap().apply { put("DEVICE-ID", md5Hex(deviceSeed)) },
         )
         try {
+            Log.i(DIAG_TAG, "sdk_login 字段 platform=$loginPlatform channel=$loginChannel")
+            Log.i(
+                DIAG_TAG,
+                "凭据形态 uid长度=${sdkSession.uid.length} key长度=${sdkSession.accessKey.length} " +
+                    "uid含空白=${sdkSession.uid.any(Char::isWhitespace)} " +
+                    "key含空白=${sdkSession.accessKey.any(Char::isWhitespace)} " +
+                    "key全为十六进制=${sdkSession.accessKey.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }} " +
+                    "deviceSeed长度=${deviceSeed.length}",
+            )
+            Log.i(
+                DIAG_TAG,
+                "登录开始 APP-VER=${profile.appVersion} RES-VER=${profile.headers["RES-VER"]} " +
+                    "PLATFORM=${profile.headers["PLATFORM"]} CHANNEL-ID=${profile.headers["CHANNEL-ID"]}",
+            )
             discoverServer(state)
+            Log.i(DIAG_TAG, "步骤1 服务器发现完成 server=${state.server}")
             loadMaintenance(state)
+            Log.i(DIAG_TAG, "步骤2 维护检查通过")
             val login = encryptedRequest(
                 state = state,
                 path = "tool/sdk_login",
@@ -49,8 +70,10 @@ class BilibiliGameProtocolGateway(
                 fields = linkedMapOf(
                     "uid" to sdkSession.uid,
                     "access_key" to sdkSession.accessKey,
-                    "platform" to "2",
-                    "channel_id" to "1",
+                    // 参考实现（cc004/pcrjjc2）的 sdk_login 字段名是 channel，不是 channel_id；
+                    // 且 platform / channel 本应按服可配，上游写死为 B 服取值。
+                    "platform" to loginPlatform,
+                    "channel" to loginChannel,
                     "challenge" to captcha?.challenge,
                     "validate" to captcha?.validate,
                     "seccode" to captcha?.let { "${it.validate}|jordan" },
@@ -59,6 +82,7 @@ class BilibiliGameProtocolGateway(
                     "captcha_code" to if (captcha == null) null else "",
                 ),
             )
+            Log.i(DIAG_TAG, "步骤3 sdk_login 完成 is_risk=${login.boolean("is_risk")}")
             if (login.boolean("is_risk") == true) return@withContext GameLoginResult.RiskRequired
 
             val gameStart = encryptedRequest(
@@ -71,6 +95,7 @@ class BilibiliGameProtocolGateway(
                     "campaign_user" to (campaignRandom.nextInt(100_001) and -2).toLong(),
                 ),
             )
+            Log.i(DIAG_TAG, "步骤4 game_start 完成 now_tutorial=${gameStart.boolean("now_tutorial")}")
             if (gameStart.boolean("now_tutorial") != true) {
                 return@withContext GameLoginResult.Rejected("账号尚未完成新手教程")
             }
@@ -81,6 +106,7 @@ class BilibiliGameProtocolGateway(
                 stage = Stage.LOAD_INDEX,
                 fields = linkedMapOf("carrier" to "OPPO"),
             )
+            Log.i(DIAG_TAG, "步骤5 load/index 完成")
             val user = load.map("user_info") ?: error("账号信息缺失")
             val viewerId = user.long("viewer_id") ?: state.viewerId.takeIf { it > 0 } ?: error("游戏 UID 缺失")
             val userName = user.string("user_name").orEmpty().ifBlank { "未命名玩家" }
@@ -89,14 +115,17 @@ class BilibiliGameProtocolGateway(
             GameLoginResult.Success(accountProfile, ProtocolSession(state, accountProfile))
         } catch (failure: GameApiFailure) {
             val message = failure.message.orEmpty().ifBlank { "游戏服拒绝请求" }.take(MAX_MESSAGE_LENGTH)
+            Log.w(DIAG_TAG, "登录失败 stage=${failure.stage} server_error=$message")
             when {
                 message.contains("维护") -> GameLoginResult.Maintenance(message)
                 failure.stage == Stage.SDK_LOGIN -> GameLoginResult.SessionRejected(message)
                 else -> GameLoginResult.Rejected(message)
             }
         } catch (failure: IOException) {
+            Log.w(DIAG_TAG, "登录网络失败 ${failure.javaClass.simpleName}: ${failure.message}")
             GameLoginResult.NetworkFailure("游戏服务器网络请求失败")
         } catch (failure: Throwable) {
+            Log.w(DIAG_TAG, "登录解析失败 ${failure.javaClass.simpleName}: ${failure.message}")
             GameLoginResult.ProtocolFailure(
                 failure.message.orEmpty().ifBlank { "游戏服务器响应无法解析" }.take(MAX_MESSAGE_LENGTH),
             )
@@ -108,6 +137,7 @@ class BilibiliGameProtocolGateway(
         val servers = envelope.data["server"]?.jsonArray.orEmpty().mapNotNull { item ->
             item.jsonPrimitive.content.trim().replace("\t", "").takeIf(String::isNotBlank)
         }
+        Log.i(DIAG_TAG, "服务器发现响应 data=${envelope.data}")
         require(servers.isNotEmpty()) { "游戏服务器列表为空" }
         val first = servers.first()
         state.server = (if (first.startsWith("http://") || first.startsWith("https://")) first else "https://$first")
@@ -126,6 +156,7 @@ class BilibiliGameProtocolGateway(
         envelope.data.string("res_ver")?.takeIf(String::isNotBlank)?.let {
             state.headers["RES-VER"] = it
         }
+        Log.i(DIAG_TAG, "维护响应 data=${envelope.data}")
         val message = envelope.data.string("maintenance_message")
         if (!message.isNullOrBlank()) throw GameApiFailure(Stage.MAINTENANCE, message)
         if (envelope.data.string("login_stop")?.toIntOrNull() == 1) {
@@ -156,9 +187,11 @@ class BilibiliGameProtocolGateway(
     ): Map<Any?, Any?> {
         val key = crypto.createKey()
         val requestMap = LinkedHashMap<String, Any?>(fields.size + 1).apply {
-            putAll(fields)
+            // 参考实现只发送有值的字段；未使用的验证码字段不应以 null 形式出现在请求里。
+            putAll(fields.filterValues { it != null })
             put("viewer_id", crypto.encryptViewerId(state.viewerId, key))
         }
+        Log.i(DIAG_TAG, "请求 $path 字段=${requestMap.keys}")
         val encrypted = crypto.encryptRequest(codec.encode(requestMap), key).toRequestBody(BINARY_MEDIA_TYPE)
         val responseBytes = execute(state, path, encrypted)
         val root = codec.decode(crypto.decryptResponse(responseBytes)).asMap()
@@ -253,6 +286,8 @@ class BilibiliGameProtocolGateway(
     }
 
     private companion object {
+        /** 诊断日志 tag：与 App 日志区分，便于 logcat -s 过滤。 */
+        const val DIAG_TAG = "LandosolGameProto"
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val BINARY_MEDIA_TYPE = "application/octet-stream".toMediaType()
         const val MAX_MESSAGE_LENGTH = 200

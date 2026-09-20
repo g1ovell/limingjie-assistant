@@ -4,17 +4,51 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 class BilibiliNativeLoginCoordinator(
-    private val sdkCoordinator: BilibiliLoginCoordinator,
-    private val sdkGateway: BilibiliSdkGateway,
+    sdkCoordinatorProvider: () -> BilibiliLoginCoordinator,
+    sdkGatewayProvider: () -> BilibiliSdkGateway,
     private val sessionStore: SdkSessionStore,
     private val gameGateway: BilibiliGameGateway,
     private val gameSessionRegistry: GameSessionRegistry,
+    /**
+     * 渠道服凭据直通：账号页填写的 loginId / password 即 uid / access_key，
+     * 跳过 B 服 SDK 登录那一层，直接进入游戏服登录。
+     */
+    private val directCredentials: Boolean = false,
 ) {
+    /** 保持旧调用点与既有测试可用；等价于 B 服模式。 */
+    constructor(
+        sdkCoordinator: BilibiliLoginCoordinator,
+        sdkGateway: BilibiliSdkGateway,
+        sessionStore: SdkSessionStore,
+        gameGateway: BilibiliGameGateway,
+        gameSessionRegistry: GameSessionRegistry,
+    ) : this(
+        { sdkCoordinator },
+        { sdkGateway },
+        sessionStore,
+        gameGateway,
+        gameSessionRegistry,
+        false,
+    )
+
+    // B 服 SDK 依赖按需求值：直通模式下绝不触发，否则会查询本机未安装的国服包。
+    private val sdkCoordinator by lazy { sdkCoordinatorProvider() }
+    private val sdkGateway by lazy { sdkGatewayProvider() }
+
     private val mutex = Mutex()
     private val pending = mutableMapOf<Long, PendingCaptcha>()
 
     suspend fun start(material: AccountLoginMaterial): NativeLoginResult = mutex.withLock {
         pending.remove(material.accountId)
+        if (directCredentials) {
+            // 渠道服：直接用已有 uid / access_key 建立会话进入游戏服登录。
+            // deviceSeed 传 loginId(uid)，与外部工具的 DEVICE-ID 推导一致。
+            // 游戏服拒绝会话时不回落到 SDK 登录，直接返回失败。
+            return@withLock loginGame(
+                material,
+                SdkSession(uid = material.loginId, accessKey = material.password),
+            )
+        }
         sdkCoordinator.cancel(material.accountId)
         val cached = sessionStore.read(material.credentialKey)
         if (cached != null) {
@@ -70,7 +104,7 @@ class BilibiliNativeLoginCoordinator(
     suspend fun cancel(accountId: Long) {
         mutex.withLock {
             pending.remove(accountId)
-            sdkCoordinator.cancel(accountId)
+            if (!directCredentials) sdkCoordinator.cancel(accountId)
         }
     }
 
@@ -119,14 +153,23 @@ class BilibiliNativeLoginCoordinator(
     private suspend fun requestGameCaptcha(
         material: AccountLoginMaterial,
         session: SdkSession,
-    ): NativeLoginResult = when (val captcha = sdkGateway.startCaptcha()) {
-        is SdkCaptchaResult.Ready -> {
-            pending[material.accountId] = PendingCaptcha.GameRisk(material, session, captcha.challenge)
-            NativeLoginResult.CaptchaRequired(captcha.challenge)
+    ): NativeLoginResult {
+        if (directCredentials) {
+            return failure(
+                LoginFailureKind.Rejected,
+                "游戏服要求风险验证，渠道服凭据模式无法完成，请在游戏内完成验证后重试",
+                material,
+            )
         }
-        is SdkCaptchaResult.NetworkFailure -> failure(LoginFailureKind.Network, captcha.message, material)
-        is SdkCaptchaResult.ProtocolFailure -> failure(LoginFailureKind.Protocol, captcha.message, material)
-        is SdkCaptchaResult.Rejected -> failure(LoginFailureKind.Rejected, captcha.message, material)
+        return when (val captcha = sdkGateway.startCaptcha()) {
+            is SdkCaptchaResult.Ready -> {
+                pending[material.accountId] = PendingCaptcha.GameRisk(material, session, captcha.challenge)
+                NativeLoginResult.CaptchaRequired(captcha.challenge)
+            }
+            is SdkCaptchaResult.NetworkFailure -> failure(LoginFailureKind.Network, captcha.message, material)
+            is SdkCaptchaResult.ProtocolFailure -> failure(LoginFailureKind.Protocol, captcha.message, material)
+            is SdkCaptchaResult.Rejected -> failure(LoginFailureKind.Rejected, captcha.message, material)
+        }
     }
 
     private fun failure(

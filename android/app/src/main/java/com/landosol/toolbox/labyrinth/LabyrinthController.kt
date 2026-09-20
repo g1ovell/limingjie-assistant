@@ -140,10 +140,13 @@ class LabyrinthController(
     private val accountRepository: AccountRepository,
     private val sessionRegistry: GameSessionRegistry,
     private val database: AppDatabase,
-    private val loginCoordinator: BilibiliNativeLoginCoordinator,
+    private val loginCoordinatorProvider: () -> BilibiliNativeLoginCoordinator,
     private val settingsStore: LabyrinthRerollSettingsStore,
     private val launchForeground: () -> Unit,
 ) {
+    // 缺少国服游戏包时，首页构造本 Controller 不应触发 BilibiliSDK 的包查询。
+    // 协调器改为按需解析：仅在登录/验证码等真实操作走到时才求值。
+    private val loginCoordinator by lazy { loginCoordinatorProvider() }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var settingsAccountId: Long? = null
     private var frozenStart: Pair<AccountListItem, LabyrinthRerollConfig>? = null

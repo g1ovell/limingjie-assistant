@@ -318,6 +318,7 @@ class MediaProjectionCaptureService : Service() {
         val hadResources: Boolean
         synchronized(captureLock) {
             hadResources = projection != null || virtualDisplay != null || imageReader != null
+            if (hadResources) android.util.Log.w("LandosolCapture", "屏幕捕获停止：$reason")
             imageReader?.setOnImageAvailableListener(null, null)
             imageReader?.close()
             imageReader = null
