@@ -157,6 +157,17 @@ internal fun labyrinthPersistedCurrentNode(route: LabyrinthRouteJson?): Labyrint
     return route.nodes.firstOrNull { it.blockId == currentBlockId }
 }
 
+/**
+ * 会话直接在 Boss 战后结算页（三连战 WIN 汇总，识别为 UNKNOWN）上启动时，入口规划器会因「未知页面」
+ * 拒绝一切点击，而 Boss 结算的「下一步」只在路线阶段处理。汇总页的 next_button 锚点是该页独有的强证据，
+ * 命中即视为中途接管。
+ */
+internal fun labyrinthBossSummaryOwnsResume(
+    result: LabyrinthEntryFrameResult,
+    minimumScore: Double = 0.68,
+): Boolean = result.observation.state == LabyrinthEntryPageState.UNKNOWN &&
+    (result.anchorMatches[EntryAnchorId.BATTLE_RESULT_BOSS_SUMMARY_NEXT_BUTTON]?.score ?: 0.0) >= minimumScore
+
 internal fun labyrinthPersistedBossNode(route: LabyrinthRouteJson?): LabyrinthNodeJson? {
     route ?: return null
     val current = labyrinthPersistedCurrentNode(route) ?: return null
@@ -1728,6 +1739,21 @@ class LabyrinthEntryRecognitionSession(
                 },
             )
             nodeLog("existing-run resume handed off directly to role reward page: ${pageState.name}")
+        }
+        if (!current.dryRun && !entryPhaseComplete && nodeExecutionConfigured() &&
+            labyrinthBossSummaryOwnsResume(result)
+        ) {
+            entryPhaseComplete = true
+            existingRunResumeHandoffArmed = false
+            if (combatContext?.kind != LabyrinthCombatKind.BOSS) {
+                activeNodeType = LabyrinthNodeTypes.BOSS
+                combatContext = LabyrinthCombatContext(LabyrinthCombatKind.BOSS)
+            }
+            _state.value = _state.value.copy(
+                combatContext = combatContext,
+                message = "检测到Boss战后结算页，接管当前路线执行并准备点击下一步",
+            )
+            nodeLog("existing-run resume handed off directly to boss settlement summary")
         }
         if (!current.dryRun && labyrinthShouldResumeOpeningSelection(entryPhaseComplete, result)) {
             entryPhaseComplete = false

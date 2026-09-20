@@ -125,7 +125,8 @@ AMS 用 `filterEquals` 比对任务根 Intent，package 不等 → 在既有任�
 |---|---|---|
 | 长战斗（Boss 三连战 >30 s）中「路线阶段未知页面超过限定时间」停机 | 战斗等待器只在编组页 `START_BATTLE` 武装；经 `BATTLE_START_CHALLENGE`（挑战按钮）开打的战斗没武装，撞 30 s UNKNOWN 超时 | `dispatchPostEntryTap` 里 `BATTLE_START_CHALLENGE` 执行成功后也 `battleWait.onStartExecuted()` |
 | 冷启动在标题页「TITLE_WAITING_TAP 动作连续失败」停机 | 小米 SDK 冷启动登录让标题画面停留 10 s+，1.2 s 间隔 × 3 次在 4 s 内耗尽 | `LabyrinthEntryActionPlannerConfig.titleTapIntervalMillis = 5_000` |
-| 挑战点击后 0.4 s 的陈旧 BATTLE_CHALLENGE 帧把刚武装的等待器清掉 | `LabyrinthBattleWaitPolicy` 的 3 s 宽限只认 BATTLE_TEAM_SELECTION | 宽限同时认 BATTLE_CHALLENGE（**此条未经完整跑验证**，装在当前 APK 里） |
+| 挑战点击后 0.4 s 的陈旧 BATTLE_CHALLENGE 帧把刚武装的等待器清掉 | `LabyrinthBattleWaitPolicy` 的 3 s 宽限只认 BATTLE_TEAM_SELECTION | 宽限同时认 BATTLE_CHALLENGE（09:23 实测：挑战帧期间显示「等待战斗结算」，生效） |
+| 会话在 Boss 三连战 WIN 汇总页上启动时卡死：「未知页面禁止启动点击」 | 汇总页识别为 UNKNOWN；入口阶段未完成，规划器拒绝点击；Boss「下一步」只在路线阶段处理 | `labyrinthBossSummaryOwnsResume()`：`battle.result.boss_summary.next_button` ≥ 0.68 即视为中途接管，置 `entryPhaseComplete` + BOSS 上下文（09:23 实测接管并点下一步） |
 
 诊断日志新增 tag：`LandosolCapture`（录屏停止原因）、`LabyrinthBattleWait`（armed / cleared / reset+caller）。
 
