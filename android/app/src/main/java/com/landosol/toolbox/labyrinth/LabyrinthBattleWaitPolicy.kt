@@ -49,6 +49,9 @@ internal class LabyrinthBattleWaitPolicy {
     }
 
     @Synchronized
+    fun isWaiting(): Boolean = startedAt != null
+
+    @Synchronized
     fun reset() {
         if (startedAt != null) {
             val caller = Throwable().stackTrace.getOrNull(1)?.let { "${it.fileName}:${it.lineNumber}" }

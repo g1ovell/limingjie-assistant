@@ -128,7 +128,13 @@ AMS 用 `filterEquals` 比对任务根 Intent，package 不等 → 在既有任�
 | 挑战点击后 0.4 s 的陈旧 BATTLE_CHALLENGE 帧把刚武装的等待器清掉 | `LabyrinthBattleWaitPolicy` 的 3 s 宽限只认 BATTLE_TEAM_SELECTION | 宽限同时认 BATTLE_CHALLENGE（09:23 实测：挑战帧期间显示「等待战斗结算」，生效） |
 | 会话在 Boss 三连战 WIN 汇总页上启动时卡死：「未知页面禁止启动点击」 | 汇总页识别为 UNKNOWN；入口阶段未完成，规划器拒绝点击；Boss「下一步」只在路线阶段处理 | `labyrinthBossSummaryOwnsResume()`：`battle.result.boss_summary.next_button` ≥ 0.68 即视为中途接管，置 `entryPhaseComplete` + BOSS 上下文（09:23 实测接管并点下一步） |
 
+| 「入口识别失败：Failed to allocate … max allowed footprint 201326592」 | 会话运行期 Java 堆稳态 165~180 MB（模板/模型/角色库常驻，**不是泄漏**：12 分钟采样无单调增长，会话停止后回落到 13 MB），顶到 192 MB 默认上限 | `AndroidManifest.xml` `android:largeHeap="true"`（本机上限变 384 MB） |
+| 会话直接在中途的角色加入页启动：「未经过初始邀请流程却进入角色加入页面」 | `existingRunResumeHandoffArmed` 只在「继续挑战」动作后武装 | `start()` 里 `resetNodeExecutionState()` **之后**武装（放前面会被它清掉——踩过），入口规划器执行第一个非继续挑战动作时解除 |
+| Boss 三连战结束瞬间被「路线阶段未知页面超过限定时间」杀掉 | `handleBattleWaitFrame` 一看到 `nodeMoveConfirmation`/`relicDetailObservation` 就 reset 等待器；这两个颜色覆盖率启发式在 WIN 汇总页（白面板+蓝按钮）误报 | 等待器武装且页面 UNKNOWN 时忽略这两个观察（日志 `battle-wait: ignoring dialog false positive`）。**未经实战验证**，需要再打一场 Boss |
+
 诊断日志新增 tag：`LandosolCapture`（录屏停止原因）、`LabyrinthBattleWait`（armed / cleared / reset+caller）。
+
+**全自动循环（批量自动执行）是下一目标。** 前提：内存稳（已 largeHeap）、中途任意页面重启会话都能接管（已覆盖：地图、路线页、Boss 汇总、角色加入/奖励）。批量流程含 retire，开跑前必须问用户。
 
 **运维经验**
 - 助手自带调试面板：`adb forward tcp:8765 tcp:8765` 后 `GET http://127.0.0.1:8765/api/state`，不用切前台就能看页面/置信度/动作数/消息。

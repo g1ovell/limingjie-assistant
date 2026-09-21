@@ -1374,6 +1374,10 @@ class LabyrinthEntryRecognitionSession(
         resetNodeExecutionState()
         resetExEncounterTracking()
         resetExEncounterTracking()
+        // 会话可能直接在中途的角色加入/角色奖励页上启动（上一段会话停在那里）。在入口规划器
+        // 执行第一个导航动作之前保持武装，让这类页面走既有的「继续挑战后恢复」交接而不是停机。
+        // 必须放在 resetNodeExecutionState() 之后，它会清掉这个标记。
+        existingRunResumeHandoffArmed = !dryRun && nodeExecutionConfigured()
         actionPlanner = if (dryRun) null else createActionPlanner()
         relicStackLedger.seedAcquisitions(relicChoicePolicy.markStacks(initialRunSnapshot?.observedRelics.orEmpty()))
         _state.value = LabyrinthEntryRecognitionSessionState(
@@ -3352,11 +3356,12 @@ class LabyrinthEntryRecognitionSession(
             }
             when (result) {
                 is AutomationActionResult.Executed -> {
-                    if (decision.kind == LabyrinthEntryActionKind.RESUME_DAWN_REALM) {
-                        // The next page may be the node map, a choice page, or an unfinished
-                        // CHARACTER_JOINED reward from before the app/session was restarted.
-                        existingRunResumeHandoffArmed = true
-                    }
+                    // The next page after resuming may be the node map, a choice page, or an
+                    // unfinished CHARACTER_JOINED reward from before the app/session was
+                    // restarted. Any other entry navigation means this is a real opening flow,
+                    // whose own CHARACTER_JOINED pages belong to the invitation planner.
+                    existingRunResumeHandoffArmed =
+                        decision.kind == LabyrinthEntryActionKind.RESUME_DAWN_REALM
                     if (activeSessionId == sessionId) {
                         val current = _state.value
                         _state.value = current.copy(
@@ -3496,9 +3501,17 @@ class LabyrinthEntryRecognitionSession(
         result: LabyrinthEntryFrameResult,
         timestampMillis: Long,
     ): Boolean {
-        if (result.relicDetailObservation != null || result.nodeMoveConfirmation != null) {
-            battleWait.reset()
-            return false
+        val dialogObserved = result.relicDetailObservation != null || result.nodeMoveConfirmation != null
+        if (dialogObserved) {
+            // 节点移动确认框和系列详情弹窗只会出现在地图上。战斗等待期间画面还是 UNKNOWN 时，这两个
+            // 颜色覆盖率启发式在战斗画面 / Boss 三连战 WIN 汇总页上会误报（白色面板 + 蓝色按钮），
+            // 一旦据此清掉等待器，30 秒 UNKNOWN 超时就会把会话杀掉。
+            if (battleWait.isWaiting() && result.observation.state == LabyrinthEntryPageState.UNKNOWN) {
+                nodeLog("battle-wait: ignoring dialog false positive on UNKNOWN frame")
+            } else {
+                battleWait.reset()
+                return false
+            }
         }
         val restartSafeBossContext = combatContext ?: labyrinthPersistedBossNode(validatedRoute)?.let {
             LabyrinthCombatContext(LabyrinthCombatKind.BOSS)
