@@ -457,6 +457,17 @@ class LandosolToolboxApplication : Application() {
             presence = presence,
             actionExecutor = automationActionExecutor,
             entryActionPlannerFactory = { LabyrinthEntryActionPlanner() },
+            channelPrompts = com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant(
+                screen = com.landosol.toolbox.automation.accessibility.AccessibilityChannelPromptScreen(),
+                // Rules follow the selected account's channel, so a 4399 rule can never fire on
+                // another channel's client even when several clients are installed.
+                rules = {
+                    com.landosol.toolbox.automation.session.ChannelLoginPromptRules.forServer(
+                        (gameClientResolution as? GameClientResolution.Available)?.server,
+                    )
+                },
+                trace = { step -> android.util.Log.i("LabyrinthReset", step) },
+            ),
             debugFramePublisher = resetDashboard?.let { dashboard ->
                 { frame, resetState, result, presentation ->
                     // The dashboard is keyed to the labyrinth session state; during a reset the
