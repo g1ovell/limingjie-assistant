@@ -6,6 +6,7 @@ import com.landosol.toolbox.automation.AutomationSessionId
 import com.landosol.toolbox.automation.AutomationSessionManager
 import com.landosol.toolbox.automation.AutomationSessionStartResult
 import com.landosol.toolbox.automation.SessionBoundActionExecutor
+import com.landosol.toolbox.automation.accessibility.GAME_NOT_FOREGROUND_REASON
 import com.landosol.toolbox.automation.capture.CaptureFrameBus
 import com.landosol.toolbox.automation.capture.CaptureFrameRegistrationResult
 import com.landosol.toolbox.automation.capture.CapturedFrame
@@ -140,6 +141,8 @@ class GameSessionResetWorkflow(
     private val totalTimeoutMillis: Long = DEFAULT_TOTAL_TIMEOUT_MILLIS,
     /** Mirrors every recognized frame to the debug dashboard so the reset phase is observable. */
     private val debugFramePublisher: ((CapturedFrame, GameSessionResetState, LabyrinthEntryFrameResult, AutomationOverlayPresentation) -> Unit)? = null,
+    /** Channel SDK login dialogs (4399 / 九游) recognised through accessibility, not frames. */
+    private val channelPrompts: ChannelLoginPromptAssistant? = null,
 ) {
     private val mutex = Mutex()
     private val actionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -166,6 +169,18 @@ class GameSessionResetWorkflow(
      */
     @Volatile
     private var clientObserved = false
+
+    /**
+     * Frames observed before this time belong to a channel SDK login dialog that the accessibility
+     * poll has just seen. The entry planner must not tap through it: 2026-10-05 九游 debug bundle,
+     * the planner read the 登录历史 dialog as an UNKNOWN pre-announcement frame and kept tapping
+     * (950,930) outside it until the reset gave up.
+     */
+    @Volatile
+    private var channelPromptVisibleUntil = Long.MIN_VALUE
+
+    @Volatile
+    private var lastChannelPromptPollAt = Long.MIN_VALUE
 
     init {
         require(totalTimeoutMillis > 0)
@@ -228,6 +243,9 @@ class GameSessionResetWorkflow(
         lastStageChangeAt = clock()
         lastObservedPage = LabyrinthEntryPageState.UNKNOWN
         clientObserved = false
+        channelPromptVisibleUntil = Long.MIN_VALUE
+        lastChannelPromptPollAt = Long.MIN_VALUE
+        channelPrompts?.reset()
         _state.value = GameSessionResetState(
             status = GameSessionResetStatus.RUNNING,
             sessionId = session.id,
@@ -439,15 +457,57 @@ class GameSessionResetWorkflow(
     ) {
         // 识别帧回调驱动推进；此处等待目标阶段被 onFrame 转换到达
         while (activeSessionId == sessionId && stage != target) {
+            if (!captureActive()) {
+                // Without frames nothing can reach the target; report why instead of idling until
+                // the total timeout (for example a rotation that outlasted the capture grace).
+                error(CaptureStateRegistry.lastStopReason() ?: "屏幕捕获已停止，请重新授权")
+            }
             if (stage == GameSessionResetStage.FAILED) error("会话重置失败")
             if (stage == GameSessionResetStage.SESSION_BLOCKED) {
                 onBlocked(sessionId, _state.value.lastBlock)
                 error("会话被阻塞：${_state.value.lastBlock}")
             }
+            pollChannelPrompts(sessionId)
             kotlinx.coroutines.delay(FRAME_POLL_MILLIS)
         }
         if (activeSessionId != sessionId) error("会话重置已被停止")
         if (stage != target) error("会话重置未到达目标阶段：$target")
+    }
+
+    /**
+     * Channel SDK login dialogs are Android views drawn over (or instead of) the game. They do not
+     * need a frame: 4399's 账号授权 page is portrait and belongs to the 4399 game center, so no
+     * landscape frame of it ever reaches the recognizer. Polled from the flow loop while the reset
+     * waits for login, sharing [inFlight] with frame actions so the two never tap at once.
+     */
+    private suspend fun pollChannelPrompts(sessionId: AutomationSessionId) {
+        val assistant = channelPrompts ?: return
+        if (stage != GameSessionResetStage.WAITING_LOGIN || _state.value.paused) return
+        val now = clock()
+        if (lastChannelPromptPollAt != Long.MIN_VALUE && now - lastChannelPromptPollAt < CHANNEL_PROMPT_POLL_MILLIS) return
+        if (!inFlight.compareAndSet(false, true)) return
+        try {
+            lastChannelPromptPollAt = now
+            when (val step = assistant.step(now)) {
+                ChannelPromptStep.None -> channelPromptVisibleUntil = Long.MIN_VALUE
+                is ChannelPromptStep.Seen -> {
+                    channelPromptVisibleUntil = now + CHANNEL_PROMPT_HOLD_MILLIS
+                    setMessage("渠道登录界面：${step.label}，确认中")
+                }
+                is ChannelPromptStep.Activated -> {
+                    channelPromptVisibleUntil = now + CHANNEL_PROMPT_HOLD_MILLIS
+                    val current = _state.value
+                    _state.value = current.copy(
+                        actionCount = current.actionCount + 1,
+                        message = "渠道登录界面：${step.label}，已点击",
+                    )
+                    overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
+                }
+                is ChannelPromptStep.Exhausted -> markFailed(sessionId, step.reason)
+            }
+        } finally {
+            inFlight.set(false)
+        }
     }
 
     private fun onFrame(
@@ -504,6 +564,11 @@ class GameSessionResetWorkflow(
         if (!inFlight.compareAndSet(false, true)) return
         actionScope.launch {
             try {
+                if (clock() < channelPromptVisibleUntil) {
+                    // A white SDK dialog can also score as a session prompt; neither the block
+                    // classifier nor the entry planner may act on it while the poll owns it.
+                    return@launch
+                }
                 val expectedExpiryPopup =
                     stage == GameSessionResetStage.TERMINATING &&
                         backend.kind == ClientTerminationKind.SESSION_EXPIRY
@@ -581,7 +646,17 @@ class GameSessionResetWorkflow(
                                 overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
                             }
                             is AutomationActionResult.Rejected ->
-                                markFailed(sessionId, "动作被拒绝：${executed.reason}")
+                                if (
+                                    executed.reason == GAME_NOT_FOREGROUND_REASON &&
+                                    stage == GameSessionResetStage.WAITING_LOGIN
+                                ) {
+                                    // A channel SDK page (4399 账号授权 lives in the 4399 game
+                                    // center) can take the foreground between the presence check
+                                    // and the tap. Nothing was tapped; wait for the next frame.
+                                    _state.value = _state.value.copy(message = "等待公主连结回到前台")
+                                } else {
+                                    markFailed(sessionId, "动作被拒绝：${executed.reason}")
+                                }
                             AutomationActionResult.StaleSession ->
                                 markFailed(sessionId, "动作会话已失效")
                             AutomationActionResult.Paused ->
@@ -704,6 +779,9 @@ class GameSessionResetWorkflow(
         const val LOG_TAG = "LabyrinthReset"
         const val OWNER = "game-session-reset"
         const val FRAME_POLL_MILLIS = 250L
+        const val CHANNEL_PROMPT_POLL_MILLIS = 500L
+        /** How long one sighting keeps frame actions away from the dialog; > one poll interval. */
+        const val CHANNEL_PROMPT_HOLD_MILLIS = 1_500L
         /** How long the PENDING peek waits for a recognised page before defaulting to termination. */
         const val PAGE_PEEK_TIMEOUT_MILLIS = 6_000L
 
