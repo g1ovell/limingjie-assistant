@@ -83,6 +83,10 @@ class LandosolToolboxApplication : Application() {
         // from even when the interesting part of the run happened much later.
         Log.i(APP_LOG_TAG, "黎明界助手启动：${AppVersion.display}")
         logGameClient()
+        // 只有登录时会临时转竖屏的渠道才容忍旋转；其他服务器保持上游「尺寸一变就停止捕获」。
+        com.landosol.toolbox.automation.capture.CaptureRotationPolicy.toleratesTransientRotation = {
+            com.landosol.toolbox.automation.session.ChannelSdkTraits.toleratesTransientRotation(selectedGameServer)
+        }
         // 自动化操作的客户端跟随选中账号的服务器；切换账号即切换目标包。
         accountServerScope.launch {
             accountRepository.observeSelectedServer().collect { server ->
@@ -143,6 +147,21 @@ class LandosolToolboxApplication : Application() {
      */
     private val gameClientResolution: GameClientResolution
         get() = GameClientResolver.resolve(selectedServer, installedGamePackages)
+
+    /** 已确认的游戏服务器；解析失败为 null。 */
+    private val selectedGameServer: GameServer?
+        get() = (gameClientResolution as? GameClientResolution.Available)?.server
+
+    /**
+     * 渠道 SDK 登录界面推进器。规则跟随选中账号的服务器，所以装了多个渠道客户端时，4399 的规则
+     * 也不会在别的渠道上触发。会话重置与入口流程各用一个实例，点击预算互不影响。
+     */
+    private fun channelLoginPromptAssistant(logTag: String) =
+        com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant(
+            screen = com.landosol.toolbox.automation.accessibility.AccessibilityChannelPromptScreen(),
+            rules = { com.landosol.toolbox.automation.session.ChannelLoginPromptRules.forServer(selectedGameServer) },
+            trace = { step -> Log.i(logTag, step) },
+        )
 
     /** 已确认的游戏包名；解析失败为 null。 */
     private val gamePackageName: String?
@@ -236,6 +255,7 @@ class LandosolToolboxApplication : Application() {
                 }
             },
             runTerminalListener = { event -> labyrinthBatchController.onRunTerminal(event) },
+            channelPrompts = channelLoginPromptAssistant("LabyrinthEntry"),
             sessionManager = automationSessionManager,
             processorFactory = { finalBossOnly ->
                 AndroidLabyrinthEntryFrameProcessor.create(
@@ -458,17 +478,10 @@ class LandosolToolboxApplication : Application() {
             presence = presence,
             actionExecutor = automationActionExecutor,
             entryActionPlannerFactory = { LabyrinthEntryActionPlanner() },
-            channelPrompts = com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant(
-                screen = com.landosol.toolbox.automation.accessibility.AccessibilityChannelPromptScreen(),
-                // Rules follow the selected account's channel, so a 4399 rule can never fire on
-                // another channel's client even when several clients are installed.
-                rules = {
-                    com.landosol.toolbox.automation.session.ChannelLoginPromptRules.forServer(
-                        (gameClientResolution as? GameClientResolution.Available)?.server,
-                    )
-                },
-                trace = { step -> android.util.Log.i("LabyrinthReset", step) },
-            ),
+            channelPrompts = channelLoginPromptAssistant("LabyrinthReset"),
+            channelSdkMayTakeForeground = {
+                com.landosol.toolbox.automation.session.ChannelSdkTraits.loginMayLeaveGamePackage(selectedGameServer)
+            },
             debugFramePublisher = resetDashboard?.let { dashboard ->
                 { frame, resetState, result, presentation ->
                     // The dashboard is keyed to the labyrinth session state; during a reset the

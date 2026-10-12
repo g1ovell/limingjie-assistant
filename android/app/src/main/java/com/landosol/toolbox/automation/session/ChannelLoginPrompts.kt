@@ -107,6 +107,22 @@ object ChannelLoginPromptRules {
     }
 }
 
+/**
+ * Behaviour that only some channel SDKs need. Each switch is keyed to the channels whose login
+ * flow was actually observed to need it; every other server keeps upstream's behaviour.
+ */
+object ChannelSdkTraits {
+    /**
+     * The SDK login page turns the display portrait for a few seconds (vivo UnionActivity, 4399
+     * 账号授权). 九游 is included because its testers ran with this tolerance on.
+     */
+    fun toleratesTransientRotation(server: GameServer?): Boolean =
+        server == GameServer.CN_VIVO || server == GameServer.CN_4399 || server == GameServer.CN_ALIGAMES
+
+    /** The SDK login can hand the foreground to another app (4399 游戏盒). */
+    fun loginMayLeaveGamePackage(server: GameServer?): Boolean = server == GameServer.CN_4399
+}
+
 object ChannelLoginPromptMatcher {
     /** 返回第一个满足规则的界面；目标不唯一或没有可点区域时不返回，宁可不点。 */
     fun find(
@@ -183,6 +199,22 @@ class ChannelLoginPromptAssistant(
         lastActivatedAt.clear()
     }
 
+    /** The prompt on screen right now, without counting a sighting or tapping. */
+    fun peek(): ChannelPromptMatch? {
+        val activeRules = rules()
+        if (activeRules.isEmpty()) return null
+        return ChannelLoginPromptMatcher.find(
+            windows = runCatching { screen.windows() }.getOrDefault(emptyList()),
+            rules = activeRules,
+        )
+    }
+
+    /** A poll saw no prompt; the next sighting starts a fresh consecutive count. */
+    fun markAbsent() {
+        lastRuleId = null
+        sightings = 0
+    }
+
     suspend fun step(nowMillis: Long): ChannelPromptStep {
         val activeRules = rules()
         if (activeRules.isEmpty()) return ChannelPromptStep.None
@@ -191,8 +223,7 @@ class ChannelLoginPromptAssistant(
             rules = activeRules,
         )
         if (match == null) {
-            lastRuleId = null
-            sightings = 0
+            markAbsent()
             return ChannelPromptStep.None
         }
         val rule = match.rule

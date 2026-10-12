@@ -248,6 +248,41 @@ class ChannelLoginPromptsTest {
     }
 
     @Test
+    fun `peek sees a prompt without counting a sighting or tapping`() = runTest {
+        val screen = FakeScreen(listOf(agreementDialog()))
+        val assistant = assistant(screen)
+
+        assertEquals("4399-agreement", assistant.peek()?.rule?.id)
+        assertEquals("4399-agreement", assistant.peek()?.rule?.id)
+        // Two peeks are not two sightings: the first real step is still only the first sighting.
+        assertTrue(assistant.step(0L) is ChannelPromptStep.Seen)
+        assertTrue(screen.activated.isEmpty())
+    }
+
+    @Test
+    fun `an absence between polls restarts the consecutive count`() = runTest {
+        val screen = FakeScreen(listOf(agreementDialog()))
+        val assistant = assistant(screen)
+
+        assistant.step(0L)
+        assistant.markAbsent()
+
+        assertTrue(assistant.step(500L) is ChannelPromptStep.Seen)
+        assertTrue(screen.activated.isEmpty())
+    }
+
+    @Test
+    fun `channel-specific SDK behaviour is enabled only where it was observed`() {
+        val rotating = GameServer.entries.filter(ChannelSdkTraits::toleratesTransientRotation)
+        val leaving = GameServer.entries.filter(ChannelSdkTraits::loginMayLeaveGamePackage)
+
+        assertEquals(listOf(GameServer.CN_VIVO, GameServer.CN_ALIGAMES, GameServer.CN_4399), rotating)
+        assertEquals(listOf(GameServer.CN_4399), leaving)
+        assertTrue(!ChannelSdkTraits.toleratesTransientRotation(null))
+        assertTrue(!ChannelSdkTraits.loginMayLeaveGamePackage(null))
+    }
+
+    @Test
     fun `rules follow the selected server`() = runTest {
         val screen = FakeScreen(listOf(agreementDialog()))
         val assistant = assistant(screen, server = GameServer.CN_XIAOMI)

@@ -189,6 +189,7 @@ class MediaProjectionCaptureService : Service() {
                 displayWidth = metrics.width,
                 displayHeight = metrics.height,
                 nowMillis = System.currentTimeMillis(),
+                tolerateRotation = CaptureRotationPolicy.toleratesTransientRotation(),
             ),
             thread,
         )
@@ -333,6 +334,7 @@ class MediaProjectionCaptureService : Service() {
                 displayWidth = metrics.width,
                 displayHeight = metrics.height,
                 nowMillis = now,
+                tolerateRotation = CaptureRotationPolicy.toleratesTransientRotation(),
             ).also { decision -> frameThread?.let { thread -> applyRotationDecision(decision, thread) } }
         }
         synchronized(captureLock) {
@@ -529,6 +531,15 @@ internal class CaptureDisplayStabilityGate(
     }
 }
 
+/**
+ * Whether a pure rotation of the display may be ridden out instead of stopping capture. Set by the
+ * application from the selected account's channel; off by default, which is upstream's behaviour.
+ */
+object CaptureRotationPolicy {
+    @Volatile
+    var toleratesTransientRotation: () -> Boolean = { false }
+}
+
 internal sealed interface CaptureRotationDecision {
     /** Whether a frame observed with this decision may be handed to recognizers. */
     val deliversFrame: Boolean get() = false
@@ -590,6 +601,7 @@ internal class CaptureTransientRotationGate(
         displayWidth: Int,
         displayHeight: Int,
         nowMillis: Long,
+        tolerateRotation: Boolean,
     ): CaptureRotationDecision {
         if (displayWidth == captureWidth && displayHeight == captureHeight) {
             if (suspendedSince != Long.MIN_VALUE) {
@@ -606,7 +618,7 @@ internal class CaptureTransientRotationGate(
         val stopReason = "屏幕尺寸从${captureWidth}x${captureHeight}变为${displayWidth}x${displayHeight}，" +
             "为避免投影画面缩在角落，请保持游戏当前方向并重新授权屏幕捕获"
         val rotatedOnly = displayWidth == captureHeight && displayHeight == captureWidth
-        if (!rotatedOnly) return CaptureRotationDecision.Stop(stopReason)
+        if (!rotatedOnly || !tolerateRotation) return CaptureRotationDecision.Stop(stopReason)
         if (suspendedSince == Long.MIN_VALUE) {
             suspendedSince = nowMillis
             resumedAt = Long.MIN_VALUE
