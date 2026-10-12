@@ -143,6 +143,8 @@ class GameSessionResetWorkflow(
     private val debugFramePublisher: ((CapturedFrame, GameSessionResetState, LabyrinthEntryFrameResult, AutomationOverlayPresentation) -> Unit)? = null,
     /** Channel SDK login dialogs (4399 / 九游) recognised through accessibility, not frames. */
     private val channelPrompts: ChannelLoginPromptAssistant? = null,
+    /** Whether the selected channel's SDK login may take the foreground into another app. */
+    private val channelSdkMayTakeForeground: () -> Boolean = { false },
 ) {
     private val mutex = Mutex()
     private val actionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -340,17 +342,25 @@ class GameSessionResetWorkflow(
                 // the launcher and the peek below can only report UNKNOWN.
                 awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
                 val observedPage = awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
-                val skipTermination = gameSessionResetSkipsTermination(observedPage, clientObserved)
+                // 2026-10-12 4399 diag: the round began with the 4399 agreement dialog already over
+                // the title. The page read UNKNOWN, so the flow tried to invalidate a session by
+                // hunting a 黎明界 trigger, timed out, and the reset failed before WAITING_LOGIN,
+                // the only stage that handles the dialog. A channel login prompt on screen means
+                // the client is still logging in: there is no session to invalidate.
+                val channelPrompt = channelPrompts?.peek()
+                val skipTermination = channelPrompt != null ||
+                    gameSessionResetSkipsTermination(observedPage, clientObserved)
                 Log.d(
                     LOG_TAG,
-                    "peek page=$observedPage clientObserved=$clientObserved skipTermination=$skipTermination",
+                    "peek page=$observedPage clientObserved=$clientObserved " +
+                        "channelPrompt=${channelPrompt?.rule?.id} skipTermination=$skipTermination",
                 )
                 if (skipTermination) {
                     setMessage(
-                        if (!clientObserved) {
-                            "未看到公主连结画面，没有可失效的旧会话；直接进入登录导航"
-                        } else {
-                            "客户端在 ${observedPage.name}，尚未载入黎明界，无需触发会话失效"
+                        when {
+                            channelPrompt != null -> "客户端停在渠道登录界面（${channelPrompt.rule.label}），无需触发会话失效"
+                            !clientObserved -> "未看到公主连结画面，没有可失效的旧会话；直接进入登录导航"
+                            else -> "客户端在 ${observedPage.name}，尚未载入黎明界，无需触发会话失效"
                         },
                     )
                     // Nothing was terminated, so the client may simply not be running. Ask the
@@ -648,7 +658,8 @@ class GameSessionResetWorkflow(
                             is AutomationActionResult.Rejected ->
                                 if (
                                     executed.reason == GAME_NOT_FOREGROUND_REASON &&
-                                    stage == GameSessionResetStage.WAITING_LOGIN
+                                    stage == GameSessionResetStage.WAITING_LOGIN &&
+                                    channelSdkMayTakeForeground()
                                 ) {
                                     // A channel SDK page (4399 账号授权 lives in the 4399 game
                                     // center) can take the foreground between the presence check
