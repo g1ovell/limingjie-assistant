@@ -188,12 +188,18 @@ class GameSessionResetWorkflow(
         require(totalTimeoutMillis > 0)
     }
 
-    suspend fun start(): GameSessionResetStartResult = mutex.withLock {
-        startLocked(onSaveRoundResult)
+    /**
+     * @param clientHardClosed the caller has just hard-closed the client (大退) before a reroll, so
+     *   there is no session to invalidate and no point waiting for the client to show up: cold-start
+     *   it and let the entry planner log in from the title.
+     */
+    suspend fun start(clientHardClosed: Boolean = false): GameSessionResetStartResult = mutex.withLock {
+        startLocked(onSaveRoundResult, clientHardClosed)
     }
 
     private suspend fun startLocked(
         saveRoundResult: suspend () -> Unit,
+        clientHardClosed: Boolean = false,
     ): GameSessionResetStartResult {
         activeSessionId?.let { return GameSessionResetStartResult.AlreadyRunning(it) }
         if (!captureActive()) {
@@ -281,6 +287,7 @@ class GameSessionResetWorkflow(
             runResetFlow(
                 sessionId = session.id,
                 saveRoundResult = saveRoundResult,
+                clientHardClosed = clientHardClosed,
             )
         }
         return GameSessionResetStartResult.Started(session.id)
@@ -327,6 +334,7 @@ class GameSessionResetWorkflow(
     private suspend fun runResetFlow(
         sessionId: AutomationSessionId,
         saveRoundResult: suspend () -> Unit,
+        clientHardClosed: Boolean = false,
     ) {
         val outcome = runCatching {
             withTimeout(totalTimeoutMillis) {
@@ -340,24 +348,30 @@ class GameSessionResetWorkflow(
                 // A round can begin while the client is still opening. Give it time to reach the
                 // foreground before judging which page it is on; otherwise every frame belongs to
                 // the launcher and the peek below can only report UNKNOWN.
-                awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
-                val observedPage = awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
+                // A hard-closed client cannot appear on its own; waiting for it only costs time.
+                if (!clientHardClosed) awaitClientObserved(sessionId, CLIENT_PRESENCE_TIMEOUT_MILLIS)
+                val observedPage = if (clientHardClosed) {
+                    LabyrinthEntryPageState.UNKNOWN
+                } else {
+                    awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
+                }
                 // 2026-10-12 4399 diag: the round began with the 4399 agreement dialog already over
                 // the title. The page read UNKNOWN, so the flow tried to invalidate a session by
                 // hunting a 黎明界 trigger, timed out, and the reset failed before WAITING_LOGIN,
                 // the only stage that handles the dialog. A channel login prompt on screen means
                 // the client is still logging in: there is no session to invalidate.
-                val channelPrompt = channelPrompts?.peek()
-                val skipTermination = channelPrompt != null ||
+                val channelPrompt = if (clientHardClosed) null else channelPrompts?.peek()
+                val skipTermination = clientHardClosed || channelPrompt != null ||
                     gameSessionResetSkipsTermination(observedPage, clientObserved)
                 Log.d(
                     LOG_TAG,
-                    "peek page=$observedPage clientObserved=$clientObserved " +
+                    "peek page=$observedPage clientObserved=$clientObserved hardClosed=$clientHardClosed " +
                         "channelPrompt=${channelPrompt?.rule?.id} skipTermination=$skipTermination",
                 )
                 if (skipTermination) {
                     setMessage(
                         when {
+                            clientHardClosed -> "游戏已在刷开局前大退，冷启动公主连结"
                             channelPrompt != null -> "客户端停在渠道登录界面（${channelPrompt.rule.label}），无需触发会话失效"
                             !clientObserved -> "未看到公主连结画面，没有可失效的旧会话；直接进入登录导航"
                             else -> "客户端在 ${observedPage.name}，尚未载入黎明界，无需触发会话失效"
@@ -365,7 +379,7 @@ class GameSessionResetWorkflow(
                     )
                     // Nothing was terminated, so the client may simply not be running. Ask the
                     // backend to bring it up; the entry planner drives everything after that.
-                    if (!clientObserved) {
+                    if (clientHardClosed || !clientObserved) {
                         transitionTo(sessionId, GameSessionResetStage.RELAUNCHING, "启动公主连结")
                         val relaunch = backend.relaunchClient()
                         if (relaunch != GameClientRelaunchResult.LAUNCH_REQUESTED) {

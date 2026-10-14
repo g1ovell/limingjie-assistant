@@ -283,6 +283,15 @@ class ChannelLoginPromptsTest {
     }
 
     @Test
+    fun `only 4399, 应用宝 and MuMu are hard-closed before a reroll`() {
+        assertEquals(
+            listOf(GameServer.CN_4399, GameServer.CN_MUMU, GameServer.CN_TENCENT),
+            GameServer.entries.filter(ChannelSdkTraits::closesClientBeforeReroll),
+        )
+        assertTrue(!ChannelSdkTraits.closesClientBeforeReroll(null))
+    }
+
+    @Test
     fun `rules follow the selected server`() = runTest {
         val screen = FakeScreen(listOf(agreementDialog()))
         val assistant = assistant(screen, server = GameServer.CN_XIAOMI)
