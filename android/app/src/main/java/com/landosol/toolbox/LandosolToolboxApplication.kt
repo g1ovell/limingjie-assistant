@@ -153,7 +153,7 @@ class LandosolToolboxApplication : Application() {
         get() = (gameClientResolution as? GameClientResolution.Available)?.server
 
     /**
-     * 渠道 SDK 登录界面推进器。规则跟随选中账号的服务器，所以装了多个渠道客户端时，4399 的规则
+     * 渠道 SDK 登录界面推进器。规则跟随选中账号的服务器，所以装了多个渠道客户端时，九游的规则
      * 也不会在别的渠道上触发。会话重置与入口流程各用一个实例，点击预算互不影响。
      */
     private fun channelLoginPromptAssistant(logTag: String) =
@@ -535,9 +535,6 @@ class LandosolToolboxApplication : Application() {
             actionExecutor = automationActionExecutor,
             entryActionPlannerFactory = { LabyrinthEntryActionPlanner() },
             channelPrompts = channelLoginPromptAssistant("LabyrinthReset"),
-            channelSdkMayTakeForeground = {
-                com.landosol.toolbox.automation.session.ChannelSdkTraits.loginMayLeaveGamePackage(selectedGameServer)
-            },
             debugFramePublisher = resetDashboard?.let { dashboard ->
                 { frame, resetState, result, presentation ->
                     // The dashboard is keyed to the labyrinth session state; during a reset the

@@ -7,10 +7,10 @@ import com.landosol.toolbox.protocol.bilibili.GameServer
  *
  * 渠道服客户端回到标题页后，会先由渠道 SDK 自己弹出登录相关界面，再把画面交还给游戏：
  *
- * - 4399：标题页上弹出「4399用户协议及隐私政策」安卓原生对话框（拒绝 / 已阅读并同意），
- *   同意后跳到竖屏的「账号授权」页（授权并登录）。
  * - 九游：标题页上弹出「登录历史」对话框，列出最近登录的游戏号，点账号条目才继续登录。
  * - vivo：竖屏 UnionActivity 网页自动登录，约 4 秒后自己回到游戏，不需要点击。
+ * - 4399 / 应用宝 / MuMu：不在这里点，改为刷开局前大退（[ChannelSdkTraits.closesClientBeforeReroll]），
+ *   让渠道 SDK 不走登出、冷启动时静默登录。
  *
  * 这些都是 SDK 画的安卓控件，不是 Unity 画面，游戏 UI 模板认不出来；但无障碍节点树能直接读到
  * 文字。所以这里只按文字认：同一窗口里必须同时出现标题文字和目标按钮文字，窗口包名必须属于
@@ -72,26 +72,7 @@ data class ChannelPromptMatch(
 )
 
 object ChannelLoginPromptRules {
-    /** 4399 游戏盒。账号授权页由它提供，竖屏。 */
-    const val PACKAGE_4399_GAME_CENTER = "com.m4399.gamecenter"
-
     fun forServer(server: GameServer?): List<ChannelLoginPromptRule> = when (server) {
-        GameServer.CN_4399 -> listOf(
-            ChannelLoginPromptRule(
-                id = "4399-agreement",
-                label = "4399 用户协议及隐私政策",
-                packages = setOf(server.packageName),
-                requiredTexts = listOf("4399用户协议及隐私政策"),
-                target = "已阅读并同意",
-            ),
-            ChannelLoginPromptRule(
-                id = "4399-account-authorization",
-                label = "4399 账号授权",
-                packages = setOf(server.packageName, PACKAGE_4399_GAME_CENTER),
-                requiredTexts = listOf("账号授权"),
-                target = "授权并登录",
-            ),
-        )
         // 2026-10-05 九游调试包：返回标题后停在「登录历史」，助手把它当成公告前画面，
         // 一直点对话框外面的 (950,930)。「最近登录」标在上次登录的账号条目里，点它就是点那个条目。
         GameServer.CN_ALIGAMES -> listOf(
@@ -118,9 +99,6 @@ object ChannelSdkTraits {
      */
     fun toleratesTransientRotation(server: GameServer?): Boolean =
         server == GameServer.CN_VIVO || server == GameServer.CN_4399 || server == GameServer.CN_ALIGAMES
-
-    /** The SDK login can hand the foreground to another app (4399 游戏盒). */
-    fun loginMayLeaveGamePackage(server: GameServer?): Boolean = server == GameServer.CN_4399
 
     /**
      * The game is hard-closed before the assistant logs in to reroll, and cold-started afterwards.

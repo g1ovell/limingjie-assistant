@@ -6,7 +6,6 @@ import com.landosol.toolbox.automation.AutomationSessionId
 import com.landosol.toolbox.automation.AutomationSessionManager
 import com.landosol.toolbox.automation.AutomationSessionStartResult
 import com.landosol.toolbox.automation.SessionBoundActionExecutor
-import com.landosol.toolbox.automation.accessibility.GAME_NOT_FOREGROUND_REASON
 import com.landosol.toolbox.automation.capture.CaptureFrameBus
 import com.landosol.toolbox.automation.capture.CaptureFrameRegistrationResult
 import com.landosol.toolbox.automation.capture.CapturedFrame
@@ -141,10 +140,8 @@ class GameSessionResetWorkflow(
     private val totalTimeoutMillis: Long = DEFAULT_TOTAL_TIMEOUT_MILLIS,
     /** Mirrors every recognized frame to the debug dashboard so the reset phase is observable. */
     private val debugFramePublisher: ((CapturedFrame, GameSessionResetState, LabyrinthEntryFrameResult, AutomationOverlayPresentation) -> Unit)? = null,
-    /** Channel SDK login dialogs (4399 / 九游) recognised through accessibility, not frames. */
+    /** Channel SDK login dialogs (九游) recognised through accessibility, not frames. */
     private val channelPrompts: ChannelLoginPromptAssistant? = null,
-    /** Whether the selected channel's SDK login may take the foreground into another app. */
-    private val channelSdkMayTakeForeground: () -> Boolean = { false },
 ) {
     private val mutex = Mutex()
     private val actionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -355,11 +352,11 @@ class GameSessionResetWorkflow(
                 } else {
                     awaitObservedPage(sessionId, PAGE_PEEK_TIMEOUT_MILLIS)
                 }
-                // 2026-10-12 4399 diag: the round began with the 4399 agreement dialog already over
-                // the title. The page read UNKNOWN, so the flow tried to invalidate a session by
-                // hunting a 黎明界 trigger, timed out, and the reset failed before WAITING_LOGIN,
-                // the only stage that handles the dialog. A channel login prompt on screen means
-                // the client is still logging in: there is no session to invalidate.
+                // A round can begin with a channel login dialog already over the title (2026-10-12
+                // diag: the page read UNKNOWN, the flow hunted a 黎明界 trigger to invalidate a
+                // session, timed out, and the reset failed before WAITING_LOGIN, the only stage
+                // that handles the dialog). A channel login prompt on screen means the client is
+                // still logging in: there is no session to invalidate.
                 val channelPrompt = if (clientHardClosed) null else channelPrompts?.peek()
                 val skipTermination = clientHardClosed || channelPrompt != null ||
                     gameSessionResetSkipsTermination(observedPage, clientObserved)
@@ -499,10 +496,10 @@ class GameSessionResetWorkflow(
     }
 
     /**
-     * Channel SDK login dialogs are Android views drawn over (or instead of) the game. They do not
-     * need a frame: 4399's 账号授权 page is portrait and belongs to the 4399 game center, so no
-     * landscape frame of it ever reaches the recognizer. Polled from the flow loop while the reset
-     * waits for login, sharing [inFlight] with frame actions so the two never tap at once.
+     * Channel SDK login dialogs are Android views drawn over the game, read through accessibility
+     * rather than frames (a portrait SDK page never yields a landscape frame). Polled from the flow
+     * loop while the reset waits for login, sharing [inFlight] with frame actions so the two never
+     * tap at once.
      */
     private suspend fun pollChannelPrompts(sessionId: AutomationSessionId) {
         val assistant = channelPrompts ?: return
@@ -670,18 +667,7 @@ class GameSessionResetWorkflow(
                                 overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
                             }
                             is AutomationActionResult.Rejected ->
-                                if (
-                                    executed.reason == GAME_NOT_FOREGROUND_REASON &&
-                                    stage == GameSessionResetStage.WAITING_LOGIN &&
-                                    channelSdkMayTakeForeground()
-                                ) {
-                                    // A channel SDK page (4399 账号授权 lives in the 4399 game
-                                    // center) can take the foreground between the presence check
-                                    // and the tap. Nothing was tapped; wait for the next frame.
-                                    _state.value = _state.value.copy(message = "等待公主连结回到前台")
-                                } else {
-                                    markFailed(sessionId, "动作被拒绝：${executed.reason}")
-                                }
+                                markFailed(sessionId, "动作被拒绝：${executed.reason}")
                             AutomationActionResult.StaleSession ->
                                 markFailed(sessionId, "动作会话已失效")
                             AutomationActionResult.Paused ->
