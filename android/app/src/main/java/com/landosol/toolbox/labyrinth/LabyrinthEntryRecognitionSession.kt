@@ -1118,7 +1118,7 @@ class LabyrinthEntryRecognitionSession(
      * Fired at most once per run id, after the run has fully stopped. Absent runId = no batch.
      */
     private val runTerminalListener: (suspend (LabyrinthRunTerminalEvent) -> Unit)? = null,
-    /** Channel SDK login dialogs (4399 / 九游) on the way from the title, read via accessibility. */
+    /** Channel SDK login dialogs (九游) on the way from the title, read via accessibility. */
     private val channelPrompts: com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant? = null,
 ) {
     private data class QueuedFrame(
@@ -1135,10 +1135,9 @@ class LabyrinthEntryRecognitionSession(
 
     /**
      * Frames observed before this time belong to a channel SDK login dialog that the accessibility
-     * poll owns. 2026-10-12 4399 diag: a run started from the title under the 4399 agreement
-     * dialog; the entry planner read it as an UNKNOWN pre-announcement frame and tapped (950,930)
-     * below it for two minutes, and the session-block path's 返回标题 point (961,739) sits on the
-     * dialog's 拒绝 | 已阅读并同意 divider.
+     * poll owns. Without the hold the entry planner reads such a dialog as an UNKNOWN
+     * pre-announcement frame and keeps tapping (950,930) outside it (2026-10-05 九游 debug bundle,
+     * 2026-10-12 diag), and the session-block path's 返回标题 point (961,739) can land on it.
      */
     @Volatile
     private var channelPromptVisibleUntil = Long.MIN_VALUE
@@ -3712,9 +3711,9 @@ class LabyrinthEntryRecognitionSession(
 
     /**
      * Polls for channel SDK login dialogs while the entry flow has not yet handed the run to route
-     * execution. Independent of frames: 4399's 账号授权 page is portrait and lives in the 4399 game
-     * center, so no landscape frame of it ever reaches the recognizer. The loop ends by itself
-     * within one interval once this session is no longer the active one.
+     * execution. Independent of frames, so a portrait SDK page that never yields a landscape frame
+     * is still seen. The loop ends by itself within one interval once this session is no longer
+     * the active one.
      */
     private fun startChannelPromptPoll(sessionId: AutomationSessionId) {
         val prompts = channelPrompts ?: return
