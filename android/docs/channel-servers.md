@@ -76,6 +76,18 @@
 - 会话重置 `WAITING_LOGIN` 阶段的点击被「游戏不在前台」拒绝时改为继续等待，只对 4399 生效（`ChannelSdkTraits.loginMayLeaveGamePackage`：账号授权页在 4399 游戏盒里）；其他渠道照旧判失败。
 - 日志：`LabyrinthReset: channel-prompt tap rule=… target=… pkg=… at=x,y attempt=n`，以及 `accepted=true/false`。
 
+## 刷开局前大退（4399 / 应用宝 / MuMu）
+
+助手刷开局要用同一账号登录游戏服，会把客户端顶号。客户端随后遇到 6002 点「返回标题」时会让渠道 SDK 登出：4399 重新弹用户协议并要求账号授权（2026-10-14 诊断包：`Back_To_Title` → `operate User not Valid` → 协议框），应用宝、MuMu 要求重新输入账号密码。进程被直接结束则不会走这次登出，下次冷启动 SDK 静默登录。只切到后台不够：进程还活着时用启动 Intent 拉起，游戏同样会返回标题。
+
+所以对这三个渠道（`ChannelSdkTraits.closesClientBeforeReroll`），刷开局在登录游戏服之前先大退客户端：
+
+- 大退：游戏在前台时先用无障碍按主页键，确认前台已不是游戏（最多 5 秒），再 `ActivityManager.killBackgroundProcesses`（`KILL_BACKGROUND_PROCESSES`，普通权限，不需要 root）。关不掉就不刷，并说明原因。
+- 覆盖三条刷取路径：批量刷开局、批量复用已读取开局前的复核、单独刷开局（含战斗失败后自动重刷）。
+- 冷启动：批量由会话重置负责，`start(clientHardClosed = true)` 跳过 20 秒在场等待与触发会话失效，直接启动游戏后走入口流程，批量记录的动作为 `hard-close-cold-start`；单独刷开局结束后直接启动游戏。
+- 其他渠道保持原来的会话失效方式。
+- 日志标签 `LandosolClient`：`hard-close home`、`hard-close killed`、`刷开局前已大退`、`刷开局结束，冷启动`。
+
 ## 屏幕临时旋转
 
 vivo 账号页、4399 账号授权页会让显示器临时转成竖屏。只对选中账号是 vivo、4399、九游（九游的测试在此设置下通过）时生效（`ChannelSdkTraits.toleratesTransientRotation` → `CaptureRotationPolicy`），其他服务器保持上游「尺寸一变就停止」。生效时捕获层不再一旋转就停止：显示器尺寸恰好是捕获尺寸的转置时，保留原横屏 VirtualDisplay、丢弃旋转期间的画面，转回原方向 1 秒后恢复投递。竖屏超过 120 秒，或尺寸变成别的分辨率，仍按原来的方式停止捕获并要求重新授权。日志标签 `LandosolCapture`。
@@ -89,4 +101,4 @@ vivo 账号页、4399 账号授权页会让显示器临时转成竖屏。只对�
 
 ## 实机验证
 
-雷电模拟器 9，1920 × 1080：小米、华为、vivo 渠道服登录、刷开局与路线执行通过；4399 可以登录。4399 / 九游的 SDK 界面推进与 vivo 临时旋转的修复只有单元测试，尚未实机验证连续多局。OPPO、MuMu、应用宝未验证。B 服登录路径与 main 相同，只是游戏包名改为按账号解析，未用 B 服账号回归。
+雷电模拟器 9，1920 × 1080：小米、华为、vivo 渠道服登录、刷开局与路线执行通过；4399 可以登录。九游、vivo 测试员报告登录修复可用；4399 的无障碍弹窗推进实机未生效，改为刷开局前大退（与应用宝、MuMu 一起）尚未实机验证。OPPO、MuMu、应用宝未验证。B 服登录路径与 main 相同，只是游戏包名改为按账号解析，未用 B 服账号回归。

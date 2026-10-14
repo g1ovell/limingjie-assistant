@@ -121,6 +121,19 @@ object ChannelSdkTraits {
 
     /** The SDK login can hand the foreground to another app (4399 游戏盒). */
     fun loginMayLeaveGamePackage(server: GameServer?): Boolean = server == GameServer.CN_4399
+
+    /**
+     * The game is hard-closed before the assistant logs in to reroll, and cold-started afterwards.
+     *
+     * Logging in from the assistant takes the account's game session (顶号). A client that then
+     * meets 6002 and goes 返回标题 logs its channel SDK out: 4399 re-shows its agreement and asks
+     * for authorization (2026-10-14 diag: `Back_To_Title` → `operate User not Valid`), 应用宝 and
+     * MuMu ask for the account password again. A process that is killed instead never runs that
+     * logout, and the SDK signs in silently on the next cold start. Sending the game to the
+     * background is not enough: relaunching a live process also takes it 返回标题.
+     */
+    fun closesClientBeforeReroll(server: GameServer?): Boolean =
+        server == GameServer.CN_4399 || server == GameServer.CN_TENCENT || server == GameServer.CN_MUMU
 }
 
 object ChannelLoginPromptMatcher {
