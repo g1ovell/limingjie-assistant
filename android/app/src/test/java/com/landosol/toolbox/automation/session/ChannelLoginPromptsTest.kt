@@ -1,5 +1,8 @@
 package com.landosol.toolbox.automation.session
 
+import com.landosol.toolbox.automation.AutomationAction
+import com.landosol.toolbox.automation.AutomationActionResult
+import com.landosol.toolbox.automation.ScreenPoint
 import com.landosol.toolbox.protocol.bilibili.GameServer
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -94,16 +97,47 @@ class ChannelLoginPromptsTest {
         assertEquals("aligames-login-history", ChannelLoginPromptMatcher.find(listOf(spaced), aligamesRules)?.rule?.id)
     }
 
-    private class FakeScreen(var windows: List<ChannelPromptWindow>, var accept: Boolean = true) : ChannelPromptScreen {
-        val activated = mutableListOf<ChannelPromptMatch>()
+    /**
+     * [windowsByRead] decides what each successive read returns, so a test can change the screen
+     * between the poll that finds the prompt and the re-read just before the click.
+     */
+    private class FakeScreen(
+        var windows: List<ChannelPromptWindow>,
+        var foreground: String? = GameServer.CN_ALIGAMES.packageName,
+        var clickResult: ChannelPromptClick = ChannelPromptClick.CLICKED,
+    ) : ChannelPromptScreen {
+        val clicked = mutableListOf<ChannelPromptMatch>()
+        var reads = 0
+        var windowsByRead: ((Int) -> List<ChannelPromptWindow>)? = null
 
-        override fun windows(): List<ChannelPromptWindow> = windows
+        override fun windows(): List<ChannelPromptWindow> {
+            reads++
+            return windowsByRead?.invoke(reads) ?: windows
+        }
 
-        override suspend fun activate(match: ChannelPromptMatch): Boolean {
-            activated += match
-            return accept
+        override fun foregroundPackage(): String? = foreground
+
+        override suspend fun click(match: ChannelPromptMatch): ChannelPromptClick {
+            clicked += match
+            return clickResult
         }
     }
+
+    private class FakeGesture(
+        var result: (AutomationAction) -> AutomationActionResult = { AutomationActionResult.Executed(it) },
+    ) {
+        val actions = mutableListOf<AutomationAction>()
+
+        operator fun invoke(action: AutomationAction): AutomationActionResult {
+            actions += action
+            return result(action)
+        }
+    }
+
+    private val noGesture = FakeGesture()
+
+    private suspend fun ChannelLoginPromptAssistant.step(now: Long, gesture: FakeGesture = noGesture) =
+        step(now) { action -> gesture(action) }
 
     private fun assistant(screen: FakeScreen, server: GameServer = GameServer.CN_ALIGAMES) = ChannelLoginPromptAssistant(
         screen = screen,
@@ -119,9 +153,9 @@ class ChannelLoginPromptsTest {
         val assistant = assistant(screen)
 
         assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(0L))
-        assertTrue(screen.activated.isEmpty())
+        assertTrue(screen.clicked.isEmpty())
         assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(500L))
-        assertEquals(listOf("最近登录"), screen.activated.map { it.target.text })
+        assertEquals(listOf("最近登录"), screen.clicked.map { it.target.text })
     }
 
     @Test
@@ -134,7 +168,7 @@ class ChannelLoginPromptsTest {
         assertEquals(ChannelPromptStep.None, assistant.step(500L))
         screen.windows = listOf(loginHistory())
         assertTrue(assistant.step(1_000L) is ChannelPromptStep.Seen)
-        assertTrue(screen.activated.isEmpty())
+        assertTrue(screen.clicked.isEmpty())
     }
 
     @Test
@@ -156,17 +190,171 @@ class ChannelLoginPromptsTest {
         // Second sighting at 500 ms, then one tap per 4 s cooldown, then a stop.
         assertEquals(listOf(500L, 4_500L, 8_500L), activatedAt)
         assertEquals(12_500L, exhaustedAt)
-        assertEquals(3, screen.activated.size)
+        assertEquals(3, screen.clicked.size)
     }
 
     @Test
     fun `a rejected tap stops instead of retrying blindly`() = runTest {
-        val screen = FakeScreen(listOf(loginHistory()), accept = false)
+        // ACTION_CLICK refused, then the session-bound gesture is refused too.
+        val screen = FakeScreen(listOf(loginHistory()), clickResult = ChannelPromptClick.REFUSED)
+        val gesture = FakeGesture { AutomationActionResult.Rejected(it, "游戏不在前台") }
         val assistant = assistant(screen)
 
-        assistant.step(0L)
+        assistant.step(0L, gesture)
 
-        assertTrue(assistant.step(500L) is ChannelPromptStep.Exhausted)
+        assertTrue(assistant.step(500L, gesture) is ChannelPromptStep.Exhausted)
+        assertEquals(1, gesture.actions.size)
+    }
+
+    @Test
+    fun `the recent-login label is pressed through its account entry`() {
+        val match = ChannelLoginPromptMatcher.find(listOf(loginHistory()), aligamesRules)
+
+        // The label itself is not clickable; the entry that holds it is, and holds no other button.
+        assertEquals(ChannelPromptBounds(576, 446, 1344, 770), match?.clickTarget?.bounds)
+    }
+
+    @Test
+    fun `a clickable container holding other buttons is not used in place of the target`() {
+        val dialog = ChannelPromptWindow(
+            aligames,
+            node(
+                children = listOf(
+                    node(
+                        bounds = ChannelPromptBounds(528, 283, 1392, 797),
+                        clickable = true,
+                        children = listOf(
+                            node("登录历史", ChannelPromptBounds(576, 320, 744, 375)),
+                            node("登录其他手机号", ChannelPromptBounds(1056, 320, 1344, 375), clickable = true),
+                            node("最近登录", ChannelPromptBounds(1164, 690, 1308, 745)),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val match = ChannelLoginPromptMatcher.find(listOf(dialog), aligamesRules)
+
+        assertEquals("aligames-login-history", match?.rule?.id)
+        assertNull(match?.clickTarget)
+    }
+
+    @Test
+    fun `a dialog that closes between recognition and the click is not pressed`() = runTest {
+        val screen = FakeScreen(listOf(loginHistory()))
+        val gesture = FakeGesture()
+        val assistant = assistant(screen)
+        assistant.step(0L, gesture)
+        // Read 2 finds the dialog for the second sighting; read 3 is the re-read before acting.
+        screen.windowsByRead = { read -> if (read >= 3) emptyList() else listOf(loginHistory()) }
+
+        assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(500L, gesture))
+        assertTrue(screen.clicked.isEmpty())
+        assertTrue(gesture.actions.isEmpty())
+    }
+
+    @Test
+    fun `a node that is gone when the click is sent is not tapped at its old position`() = runTest {
+        val screen = FakeScreen(listOf(loginHistory()), clickResult = ChannelPromptClick.GONE)
+        val gesture = FakeGesture()
+        val assistant = assistant(screen)
+        assistant.step(0L, gesture)
+
+        assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(500L, gesture))
+        assertTrue(gesture.actions.isEmpty())
+        // The attempt did not use up the budget: once the node is back, the next press goes through.
+        assistant.step(1_000L, gesture)
+        screen.clickResult = ChannelPromptClick.CLICKED
+        assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(1_500L, gesture))
+    }
+
+    @Test
+    fun `a foreground change before the click refuses it`() = runTest {
+        // The user pulled down the notification shade after the dialog was recognised.
+        val screen = FakeScreen(listOf(loginHistory()), foreground = "com.android.systemui")
+        val gesture = FakeGesture()
+        val assistant = assistant(screen)
+
+        assistant.step(0L, gesture)
+        assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(500L, gesture))
+        assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(1_000L, gesture))
+        assertTrue(screen.clicked.isEmpty())
+        assertTrue(gesture.actions.isEmpty())
+    }
+
+    @Test
+    fun `a target that moved before the click is not pressed`() = runTest {
+        val screen = FakeScreen(listOf(loginHistory()))
+        val assistant = assistant(screen)
+        assistant.step(0L)
+        val original = loginHistory()
+        val moved = original.copy(
+            root = original.root.copy(
+                children = original.root.children.map { child ->
+                    child.copy(
+                        children = child.children.map { badge ->
+                            if (badge.text == "最近登录") badge.copy(bounds = ChannelPromptBounds(1164, 600, 1308, 655)) else badge
+                        },
+                    )
+                },
+            ),
+        )
+        screen.windowsByRead = { read -> if (read >= 3) listOf(moved) else listOf(original) }
+
+        assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(500L))
+        assertTrue(screen.clicked.isEmpty())
+    }
+
+    @Test
+    fun `without a clickable entry the tap goes through the session-bound gesture`() = runTest {
+        val bare = ChannelPromptWindow(
+            aligames,
+            node(
+                children = listOf(
+                    node("登录历史", ChannelPromptBounds(576, 320, 744, 375)),
+                    node("最近登录", ChannelPromptBounds(1164, 690, 1308, 745)),
+                ),
+            ),
+        )
+        val screen = FakeScreen(listOf(bare))
+        val gesture = FakeGesture()
+        val assistant = assistant(screen)
+
+        assistant.step(0L, gesture)
+
+        assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(500L, gesture))
+        assertTrue(screen.clicked.isEmpty())
+        assertEquals(listOf(AutomationAction.Tap(ScreenPoint(1236f, 717.5f))), gesture.actions)
+    }
+
+    @Test
+    fun `a refused ACTION_CLICK falls back to the session-bound gesture`() = runTest {
+        val screen = FakeScreen(listOf(loginHistory()), clickResult = ChannelPromptClick.REFUSED)
+        val gesture = FakeGesture()
+        val assistant = assistant(screen)
+
+        assistant.step(0L, gesture)
+
+        assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(500L, gesture))
+        assertEquals(1, screen.clicked.size)
+        assertEquals(1, gesture.actions.size)
+    }
+
+    @Test
+    fun `a paused session neither taps nor spends the budget`() = runTest {
+        val bare = ChannelPromptWindow(
+            aligames,
+            node(children = listOf(node("登录历史"), node("最近登录", ChannelPromptBounds(1164, 690, 1308, 745)))),
+        )
+        val screen = FakeScreen(listOf(bare))
+        val gesture = FakeGesture { AutomationActionResult.Paused }
+        val assistant = assistant(screen)
+
+        assistant.step(0L, gesture)
+        assertEquals(ChannelPromptStep.Seen("九游登录历史"), assistant.step(500L, gesture))
+        gesture.result = { AutomationActionResult.Executed(it) }
+        assistant.step(1_000L, gesture)
+        assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(1_500L, gesture))
     }
 
     @Test
@@ -178,7 +366,7 @@ class ChannelLoginPromptsTest {
         assertEquals("aligames-login-history", assistant.peek()?.rule?.id)
         // Two peeks are not two sightings: the first real step is still only the first sighting.
         assertTrue(assistant.step(0L) is ChannelPromptStep.Seen)
-        assertTrue(screen.activated.isEmpty())
+        assertTrue(screen.clicked.isEmpty())
     }
 
     @Test
@@ -190,7 +378,7 @@ class ChannelLoginPromptsTest {
         assistant.markAbsent()
 
         assertTrue(assistant.step(500L) is ChannelPromptStep.Seen)
-        assertTrue(screen.activated.isEmpty())
+        assertTrue(screen.clicked.isEmpty())
     }
 
     @Test
@@ -218,6 +406,6 @@ class ChannelLoginPromptsTest {
 
         assertEquals(ChannelPromptStep.None, assistant.step(0L))
         assertEquals(ChannelPromptStep.None, assistant.step(500L))
-        assertTrue(screen.activated.isEmpty())
+        assertTrue(screen.clicked.isEmpty())
     }
 }

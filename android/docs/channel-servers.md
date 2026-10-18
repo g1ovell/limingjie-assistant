@@ -72,8 +72,10 @@
 - 规则按选中账号的服务器取；其他渠道没有规则，什么都不点。
 - 目标文字必须完全相等且整窗唯一，所以「登录其他手机号」这类按钮永远不会被点。
 - 同一界面连续两次轮询都认到才点；同一规则两次点击至少隔 4 秒，最多 3 次，用完仍在就停止会话重置并写明原因。
+- 点击前重新读一次窗口复核：活动窗口仍属于该包、同一规则仍认得出（标题仍在、目标仍唯一）、目标与点击区域位置都没变；任何一项变了就不点，从头重新确认（不计入点击次数）。
+- 点击方式：目标可点就对它发 `ACTION_CLICK`；不可点时找往上至多 3 层、包住目标且内部没有其他可点节点的祖先（九游「最近登录」所在的账号条目）发 `ACTION_CLICK`，点之前按文字和位置重新找到活节点，找不到就不点。没有这样的祖先或 `ACTION_CLICK` 被拒绝时才发手势，手势走流程自己的 `SessionBoundActionExecutor`（任务会话、暂停、前台包校验与其他入口动作相同）。
 - 认到界面后 1.5 秒内，画面识别既不判阻塞弹窗，也不让入口规划器点击（九游对话框曾被当作公告前画面，一直点对话框外的 (950,930)；入口流程「返回标题」的点击点 (961,739) 也可能落在对话框上）。
-- 日志：`LabyrinthReset: channel-prompt tap rule=… target=… pkg=… at=x,y attempt=n`，以及 `accepted=true/false`。
+- 日志：`LabyrinthReset: channel-prompt tap rule=… target=… pkg=… at=x,y attempt=n`，以及 `result=Done(via=click|gesture)/Gone/Paused/Refused(…)`；复核不通过记 `channel-prompt skip rule=… reason=…`。
 
 ## 刷开局前大退（4399 / 应用宝 / MuMu）
 
@@ -82,10 +84,13 @@
 所以对这三个渠道（`ChannelSdkTraits.closesClientBeforeReroll`），刷开局在登录游戏服之前先大退客户端：
 
 - 大退：游戏在前台时先用无障碍按主页键，确认前台已不是游戏（最多 5 秒），再 `ActivityManager.killBackgroundProcesses`（`KILL_BACKGROUND_PROCESSES`，普通权限，不需要 root）。关不掉就不刷，并说明原因。
+- Android 14（API 34）起该 API 对其他应用无效（只记 `Invalid packageName`），所以在 Android 14 及以上这三个渠道直接不刷开局并说明原因，不按主页键、不调用。
+- 这个 API 不返回结果，调用没抛异常不代表进程已结束，所以它只算「已请求大退」。是否真的结束由冷启动确认：会话重置启动游戏后，必须先看到标题页（`TITLE_WAITING_TAP`）；在那之前只允许启动画面、加载画面和认不出的帧，如果连续两帧认到主页、冒险、黎明界等游戏内页面，或出现会话失效弹窗，就判定「大退未生效，游戏进程仍在」并停止，不接管旧会话（`ColdStartTitleGate`）。看到标题页之前入口规划器不在游戏内页面上点击，也不会因认到黎明界而结束重置。
+- 大退凭证：请求大退成功后发一张一次性凭证，绑定账号 ID 与游戏包名（`GameClientHardCloseLedger`）。每次刷开局开始（不论渠道）、批量开始与停止时清空；同步客户端时无论成功与否都先取走，只有账号和包名都与当前一致才按「已大退」冷启动。所以刷取失败残留的凭证不会被另一账号或另一渠道的任务用上。
 - 覆盖三条刷取路径：批量刷开局、批量复用已读取开局前的复核、单独刷开局（含战斗失败后自动重刷）。
-- 冷启动：批量由会话重置负责，`start(clientHardClosed = true)` 跳过 20 秒在场等待与触发会话失效，直接启动游戏后走入口流程，批量记录的动作为 `hard-close-cold-start`；单独刷开局结束后直接启动游戏。
+- 冷启动：批量由会话重置负责，`start(clientHardClosed = true)` 跳过 20 秒在场等待与触发会话失效，直接启动游戏后走入口流程，批量记录的动作为 `hard-close-cold-start`；单独刷开局结束后直接启动游戏（这条路径没有画面识别，不做冷启动确认，由用户接手）。
 - 其他渠道保持原来的会话失效方式。
-- 日志标签 `LandosolClient`：`hard-close home`、`hard-close killed`、`刷开局前已大退`、`刷开局结束，冷启动`。
+- 日志标签 `LandosolClient`：`hard-close home`、`hard-close kill-requested`、`刷开局前已请求大退`、`大退凭证 账号=… 包=… 有效=…`、`刷开局结束，冷启动`。
 
 ## 屏幕临时旋转
 

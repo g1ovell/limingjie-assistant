@@ -216,9 +216,9 @@ class LabyrinthController(
      * reroll, or null to go on. The application uses it to hard-close channel clients whose SDK
      * logs out when the client is taken over (ChannelSdkTraits.closesClientBeforeReroll).
      */
-    private val beforeRerollLogin: suspend () -> String? = { null },
+    private val beforeRerollLogin: suspend (accountId: Long) -> String? = { null },
     /** Runs after a standalone (non-batch) reroll ends; the batch cold-starts the client itself. */
-    private val afterStandaloneReroll: suspend () -> Unit = {},
+    private val afterStandaloneReroll: suspend (accountId: Long) -> Unit = {},
 ) {
     // 缺少国服游戏包时，首页构造本 Controller 不应触发 BilibiliSDK 的包查询。
     // 协调器改为按需解析：仅在登录/验证码等真实操作走到时才求值。
@@ -435,7 +435,7 @@ class LabyrinthController(
         val config = labyrinthBatchRerollConfig(base, guildId, difficulty)
         chrome.update { it.copy(isWorking = true, message = null, progress = "批量：正在刷取 $guildId", routeBlockIds = emptyList()) }
         try {
-            beforeRerollLogin()?.let { reason -> return failure(reason) }
+            beforeRerollLogin(account.id)?.let { reason -> return failure(reason) }
             var sessionResets = 0
             while (true) {
                 val session = ensureGameSession(account, PendingLoginAction.START)
@@ -515,7 +515,7 @@ class LabyrinthController(
         }
         // The explicit read that produced this opening already took the client's session; close
         // the client before it can meet 6002, so the batch cold-starts it instead.
-        beforeRerollLogin()?.let { reason ->
+        beforeRerollLogin(account.id)?.let { reason ->
             return com.landosol.toolbox.labyrinth.batch.LabyrinthBatchReusableOpeningCheck.Failure(reason)
         }
         val session = sessionRegistry.read(accountId)
@@ -553,7 +553,7 @@ class LabyrinthController(
         runningJob = scope.launch {
             chrome.update { it.copy(isWorking = true, message = null, routeBlockIds = emptyList()) }
             try {
-                beforeRerollLogin()?.let { reason ->
+                beforeRerollLogin(account.id)?.let { reason ->
                     chrome.update { it.copy(message = reason) }
                     return@launch
                 }
@@ -625,7 +625,7 @@ class LabyrinthController(
                 chrome.update { it.copy(isWorking = false, progress = null) }
                 // A captcha pause resumes this reroll later; the client stays closed until then.
                 if (chrome.value.captcha == null) {
-                    withContext(NonCancellable) { runCatching { afterStandaloneReroll() } }
+                    withContext(NonCancellable) { runCatching { afterStandaloneReroll(account.id) } }
                 }
                 if (chrome.value.captcha == null) frozenStart = null
                 runningJob = null

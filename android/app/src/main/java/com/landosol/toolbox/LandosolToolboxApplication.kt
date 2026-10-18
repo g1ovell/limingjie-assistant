@@ -394,14 +394,13 @@ class LandosolToolboxApplication : Application() {
             accountRepository, gameSessionRegistry, database, { bilibiliNativeLoginCoordinator },
             com.landosol.toolbox.labyrinth.AndroidLabyrinthRerollSettingsStore(this),
             launchForeground = { com.landosol.toolbox.labyrinth.LabyrinthRerollService.start(this) },
-            beforeRerollLogin = { hardCloseChannelClientBeforeReroll() },
-            afterStandaloneReroll = { coldStartChannelClientAfterReroll() },
+            beforeRerollLogin = { accountId -> hardCloseChannelClientBeforeReroll(accountId) },
+            afterStandaloneReroll = { accountId -> coldStartChannelClientAfterReroll(accountId) },
         )
     }
 
-    /** Set once a reroll hard-closed the client; the next client sync cold-starts it. */
-    @Volatile
-    private var gameClientHardClosedForReroll = false
+    /** Issued when a reroll hard-closed the client; the next client sync for that account cold-starts it. */
+    private val gameClientHardCloseLedger = com.landosol.toolbox.automation.session.GameClientHardCloseLedger()
 
     private val gameClientHardCloser by lazy {
         com.landosol.toolbox.automation.session.GameClientHardCloser(
@@ -414,6 +413,8 @@ class LandosolToolboxApplication : Application() {
             killBackgroundProcesses = { packageName ->
                 getSystemService(android.app.ActivityManager::class.java).killBackgroundProcesses(packageName)
             },
+            canKillOtherApps = android.os.Build.VERSION.SDK_INT <=
+                com.landosol.toolbox.automation.session.GameClientHardCloser.LAST_SDK_THAT_KILLS_OTHER_APPS,
             trace = { step -> Log.i(CLIENT_LOG_TAG, step) },
         )
     }
@@ -422,7 +423,9 @@ class LandosolToolboxApplication : Application() {
      * 4399、应用宝、MuMu：刷开局登录游戏服之前先大退客户端（ChannelSdkTraits.closesClientBeforeReroll）。
      * 关不掉就不刷，避免客户端随后遇到 6002 返回标题、让渠道 SDK 登出。
      */
-    private suspend fun hardCloseChannelClientBeforeReroll(): String? {
+    private suspend fun hardCloseChannelClientBeforeReroll(accountId: Long): String? {
+        // Whatever an earlier reroll left behind is void from here on, whichever channel this is.
+        gameClientHardCloseLedger.clear()
         val server = selectedGameServer
             ?.takeIf(com.landosol.toolbox.automation.session.ChannelSdkTraits::closesClientBeforeReroll)
             ?: return null
@@ -430,9 +433,10 @@ class LandosolToolboxApplication : Application() {
             return "${server.displayName}刷开局前需要先大退游戏，但无障碍服务未连接"
         }
         return when (val result = gameClientHardCloser.close(server.packageName)) {
-            com.landosol.toolbox.automation.session.GameClientHardCloseResult.Closed -> {
-                gameClientHardClosedForReroll = true
-                Log.i(CLIENT_LOG_TAG, "刷开局前已大退 ${server.packageName}")
+            com.landosol.toolbox.automation.session.GameClientHardCloseResult.KillRequested -> {
+                // Only a request: the cold start that follows must still prove the process died.
+                gameClientHardCloseLedger.issue(accountId, server.packageName)
+                Log.i(CLIENT_LOG_TAG, "刷开局前已请求大退 ${server.packageName}（账号 $accountId）")
                 null
             }
             is com.landosol.toolbox.automation.session.GameClientHardCloseResult.Failed ->
@@ -441,17 +445,21 @@ class LandosolToolboxApplication : Application() {
     }
 
     /** 单独刷开局（非批量）结束后冷启动被大退的客户端；批量由会话重置负责冷启动。 */
-    private fun coldStartChannelClientAfterReroll() {
-        if (!consumeGameClientHardClosed()) return
-        val target = gamePackageName ?: return
+    private fun coldStartChannelClientAfterReroll(accountId: Long) {
+        val target = gamePackageName
+        if (!consumeGameClientHardClosed(accountId, target) || target == null) return
         val intent = gameLaunchIntent(target) ?: return
         runCatching { startActivity(intent) }
             .onSuccess { Log.i(CLIENT_LOG_TAG, "刷开局结束，冷启动 $target") }
             .onFailure { Log.w(CLIENT_LOG_TAG, "刷开局结束后冷启动 $target 失败：${it.message}") }
     }
 
-    private fun consumeGameClientHardClosed(): Boolean =
-        gameClientHardClosedForReroll.also { gameClientHardClosedForReroll = false }
+    /** Spends the hard-close ticket; true only if it was issued for this account and client. */
+    private fun consumeGameClientHardClosed(accountId: Long?, packageName: String?): Boolean {
+        val matched = gameClientHardCloseLedger.consume(accountId, packageName)
+        Log.i(CLIENT_LOG_TAG, "大退凭证 账号=$accountId 包=$packageName 有效=$matched")
+        return matched
+    }
 
     private suspend fun validateLabyrinthExecutionForAccount(
         accountId: Long?,
@@ -577,18 +585,19 @@ class LandosolToolboxApplication : Application() {
                     opening: com.landosol.toolbox.labyrinth.batch.LabyrinthBatchReusableOpening,
                 ) = labyrinthController.verifyReusableOpeningForBatch(accountId, opening)
 
-                override suspend fun invalidateClientSessionAndReturn():
+                override suspend fun invalidateClientSessionAndReturn(accountId: Long):
                     com.landosol.toolbox.labyrinth.batch.LabyrinthBatchInvalidationResult {
                     // AnchorTriggerSessionExpiryTerminator taps the recognised trigger, expects the
                     // "session expired" popup, taps 返回标题, then the entry planner navigates
                     // title → home → adventure → labyrinth home. READY means the stale local
                     // state is gone and the new server entry is what the client sees.
+                    // Spent before anything can fail, so it never outlives this sync.
+                    val hardClosed = consumeGameClientHardClosed(accountId, gamePackageName)
                     if (!CaptureStateRegistry.isActive()) {
                         return com.landosol.toolbox.labyrinth.batch.LabyrinthBatchInvalidationResult.Failure(
                             "屏幕捕获已停止" + (CaptureStateRegistry.lastStopReason()?.let { "（$it）" } ?: ""),
                         )
                     }
-                    val hardClosed = consumeGameClientHardClosed()
                     return when (val started = gameSessionResetWorkflow.start(clientHardClosed = hardClosed)) {
                         is GameSessionResetStartResult.Started -> {
                             val final = gameSessionResetWorkflow.state.first { !it.running }
@@ -708,6 +717,8 @@ class LandosolToolboxApplication : Application() {
         )
         val batchId = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT)
             .format(java.util.Date())
+        // A new batch never inherits a hard close from an earlier task.
+        gameClientHardCloseLedger.clear()
         autoRunJob = autoRunScope.launch {
             labyrinthBatchController.start(
                 batchId = batchId,
@@ -723,6 +734,7 @@ class LandosolToolboxApplication : Application() {
     fun stopLabyrinthAutoRun() {
         autoRunJob?.cancel()
         autoRunJob = null
+        gameClientHardCloseLedger.clear()
         autoRunScope.launch {
             labyrinthBatchController.stop("用户停止自动执行")
             gameSessionResetWorkflow.stop("用户停止自动执行")

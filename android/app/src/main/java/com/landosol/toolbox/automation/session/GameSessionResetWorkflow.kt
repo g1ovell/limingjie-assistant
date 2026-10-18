@@ -181,6 +181,14 @@ class GameSessionResetWorkflow(
     @Volatile
     private var lastChannelPromptPollAt = Long.MIN_VALUE
 
+    /**
+     * Set when this run cold-starts a client that was hard-closed before the reroll. Until the
+     * title page is seen, no frame may complete the reset or drive the entry planner: a page from
+     * a process that survived the kill would be taken over with a stale session.
+     */
+    @Volatile
+    private var coldStartGate: ColdStartTitleGate? = null
+
     init {
         require(totalTimeoutMillis > 0)
     }
@@ -251,6 +259,7 @@ class GameSessionResetWorkflow(
         channelPromptVisibleUntil = Long.MIN_VALUE
         lastChannelPromptPollAt = Long.MIN_VALUE
         channelPrompts?.reset()
+        coldStartGate = if (clientHardClosed) ColdStartTitleGate() else null
         _state.value = GameSessionResetState(
             status = GameSessionResetStatus.RUNNING,
             sessionId = session.id,
@@ -509,7 +518,11 @@ class GameSessionResetWorkflow(
         if (!inFlight.compareAndSet(false, true)) return
         try {
             lastChannelPromptPollAt = now
-            when (val step = assistant.step(now)) {
+            val gesture: suspend (com.landosol.toolbox.automation.AutomationAction) -> AutomationActionResult = { action ->
+                actionExecutor?.execute(sessionId, action)
+                    ?: AutomationActionResult.Rejected(action, "入口动作执行器未配置")
+            }
+            when (val step = assistant.step(now, gesture)) {
                 ChannelPromptStep.None -> channelPromptVisibleUntil = Long.MIN_VALUE
                 is ChannelPromptStep.Seen -> {
                     channelPromptVisibleUntil = now + CHANNEL_PROMPT_HOLD_MILLIS
@@ -595,9 +608,16 @@ class GameSessionResetWorkflow(
                         backend.kind == ClientTerminationKind.SESSION_EXPIRY
                 if (block != SessionBlockKind.NONE && !expectedExpiryPopup) {
                     stage = GameSessionResetStage.SESSION_BLOCKED
+                    // A session prompt before the title of a hard-closed client most likely means
+                    // the old process is still there and just met 6002.
+                    val beforeColdStartTitle = coldStartGate?.titleSeen == false
                     _state.value = _state.value.copy(
                         stage = GameSessionResetStage.SESSION_BLOCKED,
-                        message = "会话被阻塞：$block",
+                        message = if (beforeColdStartTitle) {
+                            "会话被阻塞：$block（冷启动尚未出现标题页，可能大退未生效、游戏进程仍在）"
+                        } else {
+                            "会话被阻塞：$block"
+                        },
                     )
                     onBlocked(sessionId, block)
                     return@launch
@@ -614,6 +634,25 @@ class GameSessionResetWorkflow(
                     // The flow is still deciding whether termination is needed; look, never act.
                     _state.value = _state.value.copy(message = "识别客户端当前页面：${pageState.name}")
                     return@launch
+                }
+                coldStartGate?.let { gate ->
+                    when (gate.observe(pageState)) {
+                        ColdStartVerdict.CONFIRMED -> Unit
+                        ColdStartVerdict.PENDING -> if (pageState != LabyrinthEntryPageState.UNKNOWN &&
+                            pageState != LabyrinthEntryPageState.GAME_LOADING_PROGRESS
+                        ) {
+                            _state.value = _state.value.copy(message = "确认冷启动：等待标题页（当前 ${pageState.name}）")
+                            return@launch
+                        }
+                        ColdStartVerdict.CLIENT_SURVIVED -> {
+                            markFailed(
+                                sessionId,
+                                "大退未生效：冷启动后先出现 ${pageState.name} 而不是标题页，游戏进程仍在；" +
+                                    "已停止，避免接管旧会话导致渠道账号登出",
+                            )
+                            return@launch
+                        }
+                    }
                 }
                 // While the terminator is still driving the client (TERMINATING / RELAUNCHING) the
                 // screen is by definition the *old* labyrinth home; recognising it as "ready" here
