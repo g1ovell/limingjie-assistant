@@ -2,6 +2,9 @@ package com.landosol.toolbox.automation.session
 
 import com.landosol.toolbox.automation.AutomationAction
 import com.landosol.toolbox.automation.AutomationActionResult
+import com.landosol.toolbox.automation.AutomationSessionId
+import com.landosol.toolbox.automation.SessionBoundActionExecutor
+import com.landosol.toolbox.automation.SessionExecutionResult
 import com.landosol.toolbox.automation.ScreenPoint
 import com.landosol.toolbox.protocol.bilibili.GameServer
 
@@ -89,7 +92,29 @@ data class ChannelPromptMatch(
      * 是账号条目里的标签）；找不到合适的条目为 null，只能走手势。
      */
     val clickTarget: ChannelPromptNode? = target.takeIf(ChannelPromptNode::clickable),
+    /**
+     * [clickTarget] 在目标上面第几层（0 是目标自己）。点击时按这个层数在活节点树上找回同一个
+     * 节点，不靠「第一个位置相同的节点」——同框的不可点文字会挡住它可点的条目。
+     */
+    val clickTargetHops: Int = 0,
 )
+
+/**
+ * 从活节点 [start]（目标）往上走 [hops] 层，返回那一个节点；它必须仍在 [wanted] 位置而且可点，
+ * 否则返回 null（界面变了，不点）。和平台无关，测试可直接用假节点。
+ */
+internal fun <T : Any> resolveChannelPromptClickOwner(
+    start: T,
+    hops: Int,
+    wanted: ChannelPromptBounds,
+    parent: (T) -> T?,
+    bounds: (T) -> ChannelPromptBounds,
+    clickable: (T) -> Boolean,
+): T? {
+    var node: T = start
+    repeat(hops) { node = parent(node) ?: return null }
+    return node.takeIf { bounds(it) == wanted && clickable(it) }
+}
 
 object ChannelLoginPromptRules {
     fun forServer(server: GameServer?): List<ChannelLoginPromptRule> = when (server) {
@@ -151,7 +176,14 @@ object ChannelLoginPromptMatcher {
                 val targets = nodes.filter { (node, _) -> node.labels.any { it == target } && !node.bounds.isEmpty }
                 if (targets.size != 1) continue
                 val (node, ancestors) = targets.single()
-                return ChannelPromptMatch(rule, window.packageName, node, clickTarget(node, ancestors))
+                val owner = clickTarget(node, ancestors)
+                return ChannelPromptMatch(
+                    rule = rule,
+                    packageName = window.packageName,
+                    target = node,
+                    clickTarget = owner?.second,
+                    clickTargetHops = owner?.first ?: 0,
+                )
             }
         }
         return null
@@ -173,23 +205,28 @@ object ChannelLoginPromptMatcher {
         val fresh = find(windows.filter { it.packageName == match.packageName }, listOf(match.rule))
             ?: return "界面已消失或目标不再唯一"
         if (fresh.target.bounds != match.target.bounds) return "目标位置已变化"
-        if (fresh.clickTarget?.bounds != match.clickTarget?.bounds) return "可点击区域已变化"
+        if (fresh.clickTarget?.bounds != match.clickTarget?.bounds || fresh.clickTargetHops != match.clickTargetHops) {
+            return "可点击区域已变化"
+        }
         return null
     }
 
     /**
      * 目标不可点时，往上最多找 [MAX_CLICK_ANCESTOR_HOPS] 层可点的祖先代替它。这个祖先必须包住
      * 目标、不是窗口根，而且自己里面没有别的可点节点——那样它才是「这一个条目」，而不是包着
-     * 好几个按钮的整个对话框。
+     * 好几个按钮的整个对话框。返回（层数, 节点）。
      */
-    private fun clickTarget(node: ChannelPromptNode, ancestors: List<ChannelPromptNode>): ChannelPromptNode? {
-        if (node.clickable) return node
-        val owner = ancestors.drop(1).asReversed().take(MAX_CLICK_ANCESTOR_HOPS)
-            .firstOrNull(ChannelPromptNode::clickable)
-            ?: return null
+    private fun clickTarget(
+        node: ChannelPromptNode,
+        ancestors: List<ChannelPromptNode>,
+    ): Pair<Int, ChannelPromptNode>? {
+        if (node.clickable) return 0 to node
+        val candidates = ancestors.drop(1).asReversed().take(MAX_CLICK_ANCESTOR_HOPS)
+        val index = candidates.indexOfFirst(ChannelPromptNode::clickable).takeIf { it >= 0 } ?: return null
+        val owner = candidates[index]
         if (!owner.bounds.contains(node.bounds)) return null
         if (owner.walk().drop(1).any(ChannelPromptNode::clickable)) return null
-        return owner
+        return index + 1 to owner
     }
 
     private const val MAX_CLICK_ANCESTOR_HOPS = 3
@@ -213,8 +250,65 @@ interface ChannelPromptScreen {
     /** 活动窗口的包名；读不到为 null。 */
     fun foregroundPackage(): String?
 
-    /** 对 [ChannelPromptMatch.clickTarget] 对应的活节点发 ACTION_CLICK。不发手势。 */
+    /**
+     * 对 [ChannelPromptMatch.clickTarget] 对应的活节点发 ACTION_CLICK。不发手势，也不做会话校验：
+     * 只能经由 [ChannelPromptActions.click] 调用。
+     */
     suspend fun click(match: ChannelPromptMatch): ChannelPromptClick
+}
+
+/** 一次受任务会话约束的动作的结果。 */
+sealed interface ChannelPromptGate<out T> {
+    data class Ran<T>(val value: T) : ChannelPromptGate<T>
+
+    /** 演练会话：动作没有真正执行。 */
+    data object DryRun : ChannelPromptGate<Nothing>
+
+    data object Paused : ChannelPromptGate<Nothing>
+
+    data class Refused(val reason: String) : ChannelPromptGate<Nothing>
+}
+
+/**
+ * 点击渠道登录界面的两种方式，都必须经过任务自己的会话校验（会话仍有效、未暂停、非演练）。
+ * 节点点击和手势共用同一道闸门，暂停对两者一样生效。
+ */
+interface ChannelPromptActions {
+    /** 会话校验通过才执行 [click]（一次 ACTION_CLICK）。 */
+    suspend fun click(click: suspend () -> ChannelPromptClick): ChannelPromptGate<ChannelPromptClick>
+
+    suspend fun tap(point: ScreenPoint): ChannelPromptGate<Unit>
+}
+
+/** 用任务的 [SessionBoundActionExecutor] 实现 [ChannelPromptActions]；没有执行器时一律拒绝。 */
+class SessionBoundChannelPromptActions(
+    private val executor: SessionBoundActionExecutor?,
+    private val sessionId: AutomationSessionId,
+) : ChannelPromptActions {
+    override suspend fun click(click: suspend () -> ChannelPromptClick): ChannelPromptGate<ChannelPromptClick> {
+        val executor = executor ?: return ChannelPromptGate.Refused(NO_EXECUTOR)
+        return when (val gated = executor.executeDirect(sessionId, click)) {
+            is SessionExecutionResult.Accepted -> gated.value?.let { ChannelPromptGate.Ran(it) } ?: ChannelPromptGate.DryRun
+            SessionExecutionResult.Paused -> ChannelPromptGate.Paused
+            SessionExecutionResult.StaleSession -> ChannelPromptGate.Refused(STALE)
+        }
+    }
+
+    override suspend fun tap(point: ScreenPoint): ChannelPromptGate<Unit> {
+        val executor = executor ?: return ChannelPromptGate.Refused(NO_EXECUTOR)
+        return when (val result = executor.execute(sessionId, AutomationAction.Tap(point))) {
+            is AutomationActionResult.Executed -> ChannelPromptGate.Ran(Unit)
+            is AutomationActionResult.DryRun -> ChannelPromptGate.DryRun
+            AutomationActionResult.Paused -> ChannelPromptGate.Paused
+            is AutomationActionResult.Rejected -> ChannelPromptGate.Refused(result.reason)
+            AutomationActionResult.StaleSession -> ChannelPromptGate.Refused(STALE)
+        }
+    }
+
+    private companion object {
+        const val NO_EXECUTOR = "入口动作执行器未配置"
+        const val STALE = "任务会话已结束"
+    }
 }
 
 sealed interface ChannelPromptStep {
@@ -279,12 +373,12 @@ class ChannelLoginPromptAssistant(
     }
 
     /**
-     * @param gesture 目标没有可点节点、或 ACTION_CLICK 被拒绝时的手势点击。调用方必须让它走任务
-     *   自己的 SessionBoundActionExecutor，保留任务会话、暂停和前台包校验。
+     * @param actions 调用方任务的会话闸门（通常是 [SessionBoundChannelPromptActions]）。节点点击和
+     *   手势都经过它，任务会话、暂停与（手势的）前台包校验都在动作真正执行时核对。
      */
     suspend fun step(
         nowMillis: Long,
-        gesture: suspend (AutomationAction) -> AutomationActionResult,
+        actions: ChannelPromptActions,
     ): ChannelPromptStep {
         val activeRules = rules()
         if (activeRules.isEmpty()) return ChannelPromptStep.None
@@ -319,7 +413,7 @@ class ChannelLoginPromptAssistant(
         }
         val bounds = match.target.bounds
         trace("channel-prompt tap rule=${rule.id} target=${rule.target} pkg=${match.packageName} at=${bounds.centerX.toInt()},${bounds.centerY.toInt()} attempt=${used + 1}")
-        val pressed = press(match, gesture)
+        val pressed = press(match, actions)
         trace("channel-prompt tap rule=${rule.id} result=$pressed")
         sightings = 0
         when (pressed) {
@@ -342,23 +436,28 @@ class ChannelLoginPromptAssistant(
 
     private fun readWindows(): List<ChannelPromptWindow> = runCatching { screen.windows() }.getOrDefault(emptyList())
 
-    private suspend fun press(
-        match: ChannelPromptMatch,
-        gesture: suspend (AutomationAction) -> AutomationActionResult,
-    ): Press {
+    private suspend fun press(match: ChannelPromptMatch, actions: ChannelPromptActions): Press {
         if (match.clickTarget != null) {
-            when (runCatching { screen.click(match) }.getOrDefault(ChannelPromptClick.GONE)) {
-                ChannelPromptClick.CLICKED -> return Press.Done("click")
-                ChannelPromptClick.GONE -> return Press.Gone
-                ChannelPromptClick.REFUSED -> Unit
+            val clicked = actions.click {
+                runCatching { screen.click(match) }.getOrDefault(ChannelPromptClick.GONE)
+            }
+            when (clicked) {
+                is ChannelPromptGate.Ran -> when (clicked.value) {
+                    ChannelPromptClick.CLICKED -> return Press.Done("click")
+                    ChannelPromptClick.GONE -> return Press.Gone
+                    ChannelPromptClick.REFUSED -> Unit
+                }
+                ChannelPromptGate.DryRun -> return Press.Done("click-dry-run")
+                ChannelPromptGate.Paused -> return Press.Paused
+                is ChannelPromptGate.Refused -> return Press.Refused(clicked.reason)
             }
         }
         val bounds = match.target.bounds
-        return when (val result = gesture(AutomationAction.Tap(ScreenPoint(bounds.centerX, bounds.centerY)))) {
-            is AutomationActionResult.Executed, is AutomationActionResult.DryRun -> Press.Done("gesture")
-            AutomationActionResult.Paused -> Press.Paused
-            is AutomationActionResult.Rejected -> Press.Refused(result.reason)
-            AutomationActionResult.StaleSession -> Press.Refused("任务会话已结束")
+        return when (val tapped = actions.tap(ScreenPoint(bounds.centerX, bounds.centerY))) {
+            is ChannelPromptGate.Ran -> Press.Done("gesture")
+            ChannelPromptGate.DryRun -> Press.Done("gesture-dry-run")
+            ChannelPromptGate.Paused -> Press.Paused
+            is ChannelPromptGate.Refused -> Press.Refused(tapped.reason)
         }
     }
 

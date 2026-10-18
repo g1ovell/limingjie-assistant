@@ -518,11 +518,8 @@ class GameSessionResetWorkflow(
         if (!inFlight.compareAndSet(false, true)) return
         try {
             lastChannelPromptPollAt = now
-            val gesture: suspend (com.landosol.toolbox.automation.AutomationAction) -> AutomationActionResult = { action ->
-                actionExecutor?.execute(sessionId, action)
-                    ?: AutomationActionResult.Rejected(action, "入口动作执行器未配置")
-            }
-            when (val step = assistant.step(now, gesture)) {
+            val actions = SessionBoundChannelPromptActions(actionExecutor, sessionId)
+            when (val step = assistant.step(now, actions)) {
                 ChannelPromptStep.None -> channelPromptVisibleUntil = Long.MIN_VALUE
                 is ChannelPromptStep.Seen -> {
                     channelPromptVisibleUntil = now + CHANNEL_PROMPT_HOLD_MILLIS

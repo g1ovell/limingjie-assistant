@@ -8,6 +8,7 @@ import com.landosol.toolbox.automation.session.ChannelPromptMatch
 import com.landosol.toolbox.automation.session.ChannelPromptNode
 import com.landosol.toolbox.automation.session.ChannelPromptScreen
 import com.landosol.toolbox.automation.session.ChannelPromptWindow
+import com.landosol.toolbox.automation.session.resolveChannelPromptClickOwner
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
@@ -16,9 +17,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
  *
  * 读取：遍历所有交互窗口（服务已声明 flagRetrieveInteractiveWindows），每个窗口拍成只读快照，
  * 节点数和深度都有上限，避免游戏或网页窗口的大树拖慢轮询。
- * 点击：只对重新找到的活节点发 ACTION_CLICK，找不到或位置变了就不点。这里从不发手势——
- * 手势由 [com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant] 交给任务自己的
- * SessionBoundActionExecutor，带任务会话、暂停与前台包校验。
+ * 点击：只对重新找到的活节点发 ACTION_CLICK，找不到或位置变了就不点。这里从不发手势，也不做
+ * 会话校验——[com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant] 把节点点击和
+ * 手势都放进任务自己的 SessionBoundActionExecutor，带任务会话、暂停（手势另有前台包）校验。
  */
 class AccessibilityChannelPromptScreen : ChannelPromptScreen {
     override fun windows(): List<ChannelPromptWindow> {
@@ -36,7 +37,16 @@ class AccessibilityChannelPromptScreen : ChannelPromptScreen {
         val service = LandosolAccessibilityService.current() ?: return ChannelPromptClick.GONE
         val wanted = match.clickTarget?.bounds ?: return ChannelPromptClick.GONE
         val node = findLiveNode(service, match)
-            ?.let { target -> clickableOwner(target, wanted) }
+            ?.let { target ->
+                resolveChannelPromptClickOwner(
+                    start = target,
+                    hops = match.clickTargetHops,
+                    wanted = wanted,
+                    parent = { runCatching { it.parent }.getOrNull() },
+                    bounds = { it.boundsInScreen() },
+                    clickable = { it.isClickable },
+                )
+            }
             ?: return ChannelPromptClick.GONE
         val clicked = onMain { node.performAction(AccessibilityNodeInfo.ACTION_CLICK) }
         return if (clicked) ChannelPromptClick.CLICKED else ChannelPromptClick.REFUSED
@@ -56,17 +66,6 @@ class AccessibilityChannelPromptScreen : ChannelPromptScreen {
             }
             .filter { node -> node.boundsInScreen() == wanted }
             .singleOrNull()
-    }
-
-    /** 快照选定的点击节点：目标自己，或往上几层里位置相同、仍可点的那个祖先。 */
-    private fun clickableOwner(target: AccessibilityNodeInfo, wanted: ChannelPromptBounds): AccessibilityNodeInfo? {
-        var node: AccessibilityNodeInfo? = target
-        repeat(MAX_CLICK_ANCESTOR_HOPS + 1) {
-            val current = node ?: return null
-            if (current.boundsInScreen() == wanted) return current.takeIf { it.isClickable }
-            node = runCatching { current.parent }.getOrNull()
-        }
-        return null
     }
 
     private fun AccessibilityNodeInfo.boundsInScreen(): ChannelPromptBounds {
@@ -104,7 +103,5 @@ class AccessibilityChannelPromptScreen : ChannelPromptScreen {
     private companion object {
         const val MAX_NODES_PER_WINDOW = 600
         const val MAX_DEPTH = 40
-        /** 与 ChannelLoginPromptMatcher 选点击祖先的层数一致。 */
-        const val MAX_CLICK_ANCESTOR_HOPS = 3
     }
 }

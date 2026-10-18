@@ -2,7 +2,13 @@ package com.landosol.toolbox.automation.session
 
 import com.landosol.toolbox.automation.AutomationAction
 import com.landosol.toolbox.automation.AutomationActionResult
+import com.landosol.toolbox.automation.AutomationBackendResult
+import com.landosol.toolbox.automation.AutomationMode
+import com.landosol.toolbox.automation.AutomationSessionManager
+import com.landosol.toolbox.automation.AutomationSessionStartResult
 import com.landosol.toolbox.automation.ScreenPoint
+import com.landosol.toolbox.automation.SessionBoundActionExecutor
+import kotlinx.coroutines.runBlocking
 import com.landosol.toolbox.protocol.bilibili.GameServer
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -123,21 +129,32 @@ class ChannelLoginPromptsTest {
         }
     }
 
+    /** Session gate that always lets node clicks through and answers taps with [result]. */
     private class FakeGesture(
         var result: (AutomationAction) -> AutomationActionResult = { AutomationActionResult.Executed(it) },
-    ) {
+    ) : ChannelPromptActions {
         val actions = mutableListOf<AutomationAction>()
 
-        operator fun invoke(action: AutomationAction): AutomationActionResult {
+        override suspend fun click(click: suspend () -> ChannelPromptClick): ChannelPromptGate<ChannelPromptClick> =
+            ChannelPromptGate.Ran(click())
+
+        override suspend fun tap(point: ScreenPoint): ChannelPromptGate<Unit> {
+            val action = AutomationAction.Tap(point)
             actions += action
-            return result(action)
+            return when (val outcome = result(action)) {
+                is AutomationActionResult.Executed -> ChannelPromptGate.Ran(Unit)
+                is AutomationActionResult.DryRun -> ChannelPromptGate.DryRun
+                AutomationActionResult.Paused -> ChannelPromptGate.Paused
+                is AutomationActionResult.Rejected -> ChannelPromptGate.Refused(outcome.reason)
+                AutomationActionResult.StaleSession -> ChannelPromptGate.Refused("stale")
+            }
         }
     }
 
     private val noGesture = FakeGesture()
 
     private suspend fun ChannelLoginPromptAssistant.step(now: Long, gesture: FakeGesture = noGesture) =
-        step(now) { action -> gesture(action) }
+        step(now, gesture)
 
     private fun assistant(screen: FakeScreen, server: GameServer = GameServer.CN_ALIGAMES) = ChannelLoginPromptAssistant(
         screen = screen,
@@ -212,6 +229,62 @@ class ChannelLoginPromptsTest {
 
         // The label itself is not clickable; the entry that holds it is, and holds no other button.
         assertEquals(ChannelPromptBounds(576, 446, 1344, 770), match?.clickTarget?.bounds)
+        assertEquals(1, match?.clickTargetHops)
+    }
+
+    /** Stand-in for a live accessibility node: just bounds, clickability and a parent link. */
+    private data class LiveNode(
+        val bounds: ChannelPromptBounds,
+        val clickable: Boolean,
+        val parent: LiveNode? = null,
+    )
+
+    private fun resolve(start: LiveNode, hops: Int, wanted: ChannelPromptBounds) =
+        resolveChannelPromptClickOwner(start, hops, wanted, LiveNode::parent, LiveNode::bounds, LiveNode::clickable)
+
+    @Test
+    fun `a label filling its clickable entry still presses the entry`() {
+        // PR #17 review 2026-10-18: the non-clickable label has exactly the entry's bounds. The
+        // live lookup used to stop at the label (first node with those bounds) and report GONE.
+        val bounds = ChannelPromptBounds(100, 100, 300, 200)
+        val snapshot = ChannelPromptWindow(
+            aligames,
+            node(
+                children = listOf(
+                    node("登录历史"),
+                    node(bounds = bounds, clickable = true, children = listOf(node("最近登录", bounds))),
+                ),
+            ),
+        )
+        val match = requireNotNull(ChannelLoginPromptMatcher.find(listOf(snapshot), aligamesRules))
+        assertEquals(bounds, match.clickTarget?.bounds)
+        assertEquals(1, match.clickTargetHops)
+
+        val entry = LiveNode(bounds, clickable = true)
+        val label = LiveNode(bounds, clickable = false, parent = entry)
+
+        assertEquals(entry, resolve(label, match.clickTargetHops, bounds))
+    }
+
+    @Test
+    fun `a label smaller than its entry presses the entry`() {
+        val bounds = ChannelPromptBounds(100, 100, 300, 200)
+        val entry = LiveNode(bounds, clickable = true)
+        val label = LiveNode(ChannelPromptBounds(150, 120, 250, 160), clickable = false, parent = entry)
+
+        assertEquals(entry, resolve(label, hops = 1, wanted = bounds))
+    }
+
+    @Test
+    fun `a live tree that no longer matches the snapshot is not pressed`() {
+        val bounds = ChannelPromptBounds(100, 100, 300, 200)
+        // The entry became unclickable, moved, or the label lost its parent since the snapshot.
+        assertNull(resolve(LiveNode(bounds, false, parent = LiveNode(bounds, clickable = false)), 1, bounds))
+        assertNull(resolve(LiveNode(bounds, false, parent = LiveNode(ChannelPromptBounds(0, 0, 9, 9), true)), 1, bounds))
+        assertNull(resolve(LiveNode(bounds, false), 1, bounds))
+        // A clickable target is its own click node.
+        val target = LiveNode(bounds, clickable = true)
+        assertEquals(target, resolve(target, 0, bounds))
     }
 
     @Test
@@ -338,6 +411,83 @@ class ChannelLoginPromptsTest {
         assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(500L, gesture))
         assertEquals(1, screen.clicked.size)
         assertEquals(1, gesture.actions.size)
+    }
+
+    private fun recentLoginDialog(clickable: Boolean) = ChannelPromptWindow(
+        aligames,
+        node(
+            children = listOf(
+                node("登录历史"),
+                node("最近登录", ChannelPromptBounds(120, 120, 240, 180), clickable = clickable),
+            ),
+        ),
+    )
+
+    /**
+     * PR #17 review 2026-10-18: the task is paused while the pre-click re-read is running, after
+     * the poll's own pause check. Neither the node click nor the gesture may then reach the screen.
+     */
+    private fun pauseDuringRecheck(clickable: Boolean) = runBlocking<Unit> {
+        val manager = AutomationSessionManager()
+        val session = (manager.start(AutomationMode.LABYRINTH, dryRun = false) as AutomationSessionStartResult.Started).session
+        var gestureTaps = 0
+        val executor = SessionBoundActionExecutor(manager) {
+            gestureTaps++
+            AutomationBackendResult.Completed
+        }
+        val screen = FakeScreen(listOf(recentLoginDialog(clickable)))
+        screen.windowsByRead = { read ->
+            if (read == 3) runBlocking { assertTrue(manager.setPaused(session.id, true)) }
+            listOf(recentLoginDialog(clickable))
+        }
+        val assistant = assistant(screen)
+        val actions = SessionBoundChannelPromptActions(executor, session.id)
+        try {
+            assistant.step(0L, actions)
+            val step = assistant.step(500L, actions)
+
+            assertEquals(ChannelPromptStep.Seen("九游登录历史"), step)
+            assertEquals(0, screen.clicked.size + gestureTaps)
+        } finally {
+            manager.stop(session.id)
+        }
+    }
+
+    @Test
+    fun `a pause during the recheck stops a direct node click`() = pauseDuringRecheck(clickable = true)
+
+    @Test
+    fun `a pause during the recheck stops a gesture click`() = pauseDuringRecheck(clickable = false)
+
+    @Test
+    fun `a dry-run session never sends the node click`() = runBlocking<Unit> {
+        val manager = AutomationSessionManager()
+        val session = (manager.start(AutomationMode.LABYRINTH, dryRun = true) as AutomationSessionStartResult.Started).session
+        val executor = SessionBoundActionExecutor(manager) { AutomationBackendResult.Completed }
+        val screen = FakeScreen(listOf(recentLoginDialog(clickable = true)))
+        val assistant = assistant(screen)
+        val actions = SessionBoundChannelPromptActions(executor, session.id)
+
+        assistant.step(0L, actions)
+
+        assertEquals(ChannelPromptStep.Activated("九游登录历史"), assistant.step(500L, actions))
+        assertTrue(screen.clicked.isEmpty())
+        manager.stop(session.id)
+    }
+
+    @Test
+    fun `node clicks for a stopped session are refused`() = runBlocking<Unit> {
+        val manager = AutomationSessionManager()
+        val session = (manager.start(AutomationMode.LABYRINTH, dryRun = false) as AutomationSessionStartResult.Started).session
+        val executor = SessionBoundActionExecutor(manager) { AutomationBackendResult.Completed }
+        val screen = FakeScreen(listOf(recentLoginDialog(clickable = true)))
+        val assistant = assistant(screen)
+        val actions = SessionBoundChannelPromptActions(executor, session.id)
+        assistant.step(0L, actions)
+        manager.stop(session.id)
+
+        assertTrue(assistant.step(500L, actions) is ChannelPromptStep.Exhausted)
+        assertTrue(screen.clicked.isEmpty())
     }
 
     @Test

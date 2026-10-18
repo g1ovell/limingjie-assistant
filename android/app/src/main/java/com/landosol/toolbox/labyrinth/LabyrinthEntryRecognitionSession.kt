@@ -3742,13 +3742,10 @@ class LabyrinthEntryRecognitionSession(
         if (!beginGuardedAction()) return
         try {
             val now = clock()
-            // A gesture fallback goes through this session's executor, so it keeps the session,
-            // pause and foreground-package checks every other entry action has.
-            val gesture: suspend (com.landosol.toolbox.automation.AutomationAction) -> AutomationActionResult = { action ->
-                actionExecutor?.execute(sessionId, action)
-                    ?: AutomationActionResult.Rejected(action, "入口动作执行器未配置")
-            }
-            when (val step = prompts.step(now, gesture)) {
+            // Node clicks and the gesture fallback both go through this session's executor, so
+            // they keep the session and pause checks every other entry action has.
+            val actions = com.landosol.toolbox.automation.session.SessionBoundChannelPromptActions(actionExecutor, sessionId)
+            when (val step = prompts.step(now, actions)) {
                 com.landosol.toolbox.automation.session.ChannelPromptStep.None -> {
                     channelPromptVisibleUntil = Long.MIN_VALUE
                     channelPromptMessage = null
